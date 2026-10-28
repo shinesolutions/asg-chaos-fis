@@ -1,0 +1,26 @@
+---
+# Attaches stage/aem-chaos-engine-<version>.zip to the GitHub release for each
+# version tag, where aem-aws-stack-builder's fetch-library playbook downloads it.
+name: Publish
+on:
+  push:
+    tags:
+      - '[0-9]+.[0-9]+.[0-9]+'
+      - '[0-9]+.[0-9]+.[0-9]+-*'
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: make ci version="${GITHUB_REF_NAME}"
+      - env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1 \
+            || gh release create "${GITHUB_REF_NAME}" --title "${GITHUB_REF_NAME}" --notes "See CHANGELOG.md"
+          gh release upload "${GITHUB_REF_NAME}" "stage/aem-chaos-engine-${GITHUB_REF_NAME}.zip" --clobber

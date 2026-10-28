@@ -1,0 +1,388 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  AEM Chaos Engine integration test harness. Deploys the chaos engine Lambda
+  against an existing, non-AEM test Auto Scaling Group. Throwaway: delete the
+  stack after testing.
+
+Parameters:
+  EngineStackPrefix:
+    Description: Stack prefix the engine runs as (SSM paths, metrics, FIS experiment tags)
+    Type: String
+    Default: chaos-engine-test
+    AllowedPattern: '[a-z0-9-]+'
+  TargetStackPrefix:
+    Description: StackPrefix tag of the instances that may be terminated
+    Type: String
+  TargetComponent:
+    Description: Component tag of the instances that may be terminated
+    Type: String
+  TargetAsgName:
+    Description: Auto Scaling Group that the target instances belong to
+    Type: String
+  TargetStackName:
+    Description: CloudFormation stack that must be stable before a termination
+    Type: String
+  TargetLoadBalancerName:
+    Description: Classic ELB in front of the target Auto Scaling Group, used for the stop condition alarm
+    Type: String
+  DryRun:
+    Description: Log decisions without claiming the day or calling FIS
+    Type: String
+    AllowedValues: ['true', 'false']
+    Default: 'true'
+  MinInService:
+    Description: Healthy InService instances required before a termination
+    Type: Number
+    Default: 2
+    MinValue: 1
+  ScheduleAt:
+    Description: >-
+      Optional one-off EventBridge Scheduler time in UTC, e.g. 2026-10-14T03:15:00.
+      Leave empty for no schedule.
+    Type: String
+    Default: ''
+
+Conditions:
+  CreateScheduleCondition:
+    Fn::Not:
+      - Fn::Equals:
+          - Ref: ScheduleAt
+          - ''
+
+Resources:
+  # --- FIS -----------------------------------------------------------------------
+
+  FisRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: fis.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount:
+                  Ref: AWS::AccountId
+              ArnLike:
+                aws:SourceArn:
+                  Fn::Sub: arn:${AWS::Partition}:fis:${AWS::Region}:${AWS::AccountId}:experiment/*
+      Policies:
+        - PolicyName: TerminateTaggedInstancesOnly
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: TerminateOnlyInstancesWithBothTargetTags
+                Effect: Allow
+                Action: ec2:TerminateInstances
+                Resource:
+                  Fn::Sub: arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*
+                Condition:
+                  StringEquals:
+                    aws:ResourceTag/StackPrefix:
+                      Ref: TargetStackPrefix
+                    aws:ResourceTag/Component:
+                      Ref: TargetComponent
+              - Sid: ResolveTargets
+                Effect: Allow
+                Action: ec2:DescribeInstances
+                Resource: '*'
+      Tags:
+        - Key: StackPrefix
+          Value:
+            Ref: EngineStackPrefix
+
+  StopConditionAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName:
+        Fn::Sub: ${EngineStackPrefix}-ChaosEngine-UnHealthyHostsAlarm
+      AlarmDescription: Blocks chaos engine experiments while any target instance is unhealthy
+      Namespace: AWS/ELB
+      MetricName: UnHealthyHostCount
+      Dimensions:
+        - Name: LoadBalancerName
+          Value:
+            Ref: TargetLoadBalancerName
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+  ExperimentTemplate:
+    Type: AWS::FIS::ExperimentTemplate
+    Properties:
+      Description:
+        Fn::Sub: Chaos engine integration test - terminate one ${TargetComponent} instance
+      RoleArn:
+        Fn::GetAtt: FisRole.Arn
+      Targets:
+        Instances:
+          ResourceType: aws:ec2:instance
+          ResourceTags:
+            StackPrefix:
+              Ref: TargetStackPrefix
+            Component:
+              Ref: TargetComponent
+          Filters:
+            - Path: State.Name
+              Values:
+                - running
+          SelectionMode: COUNT(1)
+      Actions:
+        TerminateInstance:
+          ActionId: aws:ec2:terminate-instances
+          Targets:
+            Instances: Instances
+      StopConditions:
+        - Source: aws:cloudwatch:alarm
+          Value:
+            Fn::GetAtt: StopConditionAlarm.Arn
+      ExperimentOptions:
+        AccountTargeting: single-account
+        EmptyTargetResolutionMode: fail
+      Tags:
+        Name:
+          Fn::Sub: ${EngineStackPrefix}-chaos-engine-test
+        StackPrefix:
+          Ref: EngineStackPrefix
+
+  # --- Engine configuration --------------------------------------------------------
+
+  ConfigParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name:
+        Fn::Sub: /aem-opencloud/${EngineStackPrefix}/chaos-engine/config
+      Description: AEM Chaos Engine integration test configuration
+      Type: String
+      # The component label is only used for validation, logs and tags. Which
+      # instances are terminated is decided by ExperimentTemplate and FisRole.
+      Value:
+        Fn::Sub: |
+          {
+            "enabled": true,
+            "dryRun": ${DryRun},
+            "timezone": "Australia/Sydney",
+            "dailyProbability": 1.0,
+            "runsPerDay": 1,
+            "retentionDays": 7,
+            "cloudFormationStackName": "${TargetStackName}",
+            "stopConditionAlarmNames": ["${StopConditionAlarm}"],
+            "targets": [
+              {
+                "component": "author-dispatcher",
+                "enabled": true,
+                "asgName": "${TargetAsgName}",
+                "fisTemplateId": "${ExperimentTemplate}",
+                "weight": 1,
+                "minInService": ${MinInService}
+              }
+            ]
+          }
+
+  # --- Lambda ------------------------------------------------------------------------
+
+  FunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName:
+        Fn::Sub: /aws/lambda/${EngineStackPrefix}-aem-chaos-engine
+      RetentionInDays: 7
+
+  FunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount:
+                  Ref: AWS::AccountId
+      Policies:
+        - PolicyName: ChaosEngine
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: Logs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  Fn::Sub: ${FunctionLogGroup.Arn}
+              - Sid: ReadConfig
+                Effect: Allow
+                Action: ssm:GetParameter
+                Resource:
+                  Fn::Sub: arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/aem-opencloud/${EngineStackPrefix}/chaos-engine/config
+              - Sid: ListClaims
+                Effect: Allow
+                Action: ssm:GetParametersByPath
+                Resource:
+                  - Fn::Sub: arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/aem-opencloud/${EngineStackPrefix}/chaos-engine/kills
+                  - Fn::Sub: arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/aem-opencloud/${EngineStackPrefix}/chaos-engine/kills/*
+              - Sid: WriteClaims
+                Effect: Allow
+                Action:
+                  - ssm:PutParameter
+                  - ssm:DeleteParameters
+                Resource:
+                  Fn::Sub: arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/aem-opencloud/${EngineStackPrefix}/chaos-engine/kills/*
+              - Sid: StartOnlyThisTemplate
+                Effect: Allow
+                Action: fis:StartExperiment
+                Resource:
+                  - Fn::Sub: arn:${AWS::Partition}:fis:${AWS::Region}:${AWS::AccountId}:experiment-template/${ExperimentTemplate}
+                  - Fn::Sub: arn:${AWS::Partition}:fis:${AWS::Region}:${AWS::AccountId}:experiment/*
+              - Sid: TagExperiments
+                Effect: Allow
+                Action: fis:TagResource
+                Resource:
+                  Fn::Sub: arn:${AWS::Partition}:fis:${AWS::Region}:${AWS::AccountId}:experiment/*
+              - Sid: ListExperiments
+                Effect: Allow
+                Action: fis:ListExperiments
+                Resource: '*'
+              - Sid: Prechecks
+                Effect: Allow
+                Action:
+                  - autoscaling:DescribeAutoScalingGroups
+                  - autoscaling:DescribeScalingActivities
+                  - ec2:DescribeInstances
+                Resource: '*'
+              # DescribeAlarms is authorised against alarm:*, so it cannot be
+              # limited to specific alarms. It is read-only.
+              - Sid: PrecheckStopConditionAlarms
+                Effect: Allow
+                Action: cloudwatch:DescribeAlarms
+                Resource: '*'
+              - Sid: PrecheckStack
+                Effect: Allow
+                Action: cloudformation:DescribeStacks
+                Resource:
+                  Fn::Sub: arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${TargetStackName}/*
+      Tags:
+        - Key: StackPrefix
+          Value:
+            Ref: EngineStackPrefix
+
+  Function:
+    Type: AWS::Lambda::Function
+    DependsOn: FunctionLogGroup
+    Properties:
+      FunctionName:
+        Fn::Sub: ${EngineStackPrefix}-aem-chaos-engine
+      Description: AEM Chaos Engine (integration test)
+      # Placeholder only. run-integration-tests.sh deploy replaces it with the
+      # locally built zip (aws lambda update-function-code). Stack updates leave
+      # the uploaded code alone as long as this property does not change.
+      # Until then, invocations fail because aem_chaos_engine.py does not exist.
+      Code:
+        ZipFile: '# Placeholder, replaced by run-integration-tests.sh deploy'
+      Handler: aem_chaos_engine.handler
+      Runtime: python3.12
+      MemorySize: 128
+      Timeout: 60
+      Role:
+        Fn::GetAtt: FunctionRole.Arn
+      Environment:
+        Variables:
+          STACK_PREFIX:
+            Ref: EngineStackPrefix
+          CONFIG_PARAMETER_NAME:
+            Ref: ConfigParameter
+          STATE_PARAMETER_PATH:
+            Fn::Sub: /aem-opencloud/${EngineStackPrefix}/chaos-engine/kills
+          LOG_LEVEL: INFO
+      Tags:
+        - Key: StackPrefix
+          Value:
+            Ref: EngineStackPrefix
+
+  FunctionInvokeConfig:
+    Type: AWS::Lambda::EventInvokeConfig
+    Properties:
+      FunctionName:
+        Ref: Function
+      Qualifier: $LATEST
+      MaximumRetryAttempts: 0
+      MaximumEventAgeInSeconds: 900
+
+  # --- Optional one-off schedule -------------------------------------------------------
+
+  SchedulerRole:
+    Type: AWS::IAM::Role
+    Condition: CreateScheduleCondition
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: scheduler.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount:
+                  Ref: AWS::AccountId
+      Policies:
+        - PolicyName: InvokeChaosEngine
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource:
+                  Fn::GetAtt: Function.Arn
+
+  Schedule:
+    Type: AWS::Scheduler::Schedule
+    Condition: CreateScheduleCondition
+    Properties:
+      Name:
+        Fn::Sub: ${EngineStackPrefix}-chaos-engine
+      Description: One-off chaos engine invocation for the integration test
+      ScheduleExpression:
+        Fn::Sub: at(${ScheduleAt})
+      ScheduleExpressionTimezone: UTC
+      FlexibleTimeWindow:
+        Mode: 'OFF'
+      Target:
+        Arn:
+          Fn::GetAtt: Function.Arn
+        RoleArn:
+          Fn::GetAtt: SchedulerRole.Arn
+        Input: '{"scheduledTime": "<aws.scheduler.scheduled-time>", "executionId": "<aws.scheduler.execution-id>"}'
+        RetryPolicy:
+          MaximumRetryAttempts: 0
+          MaximumEventAgeInSeconds: 60
+
+Outputs:
+  FunctionName:
+    Value:
+      Ref: Function
+  FisRoleArn:
+    Value:
+      Fn::GetAtt: FisRole.Arn
+  FunctionRoleArn:
+    Value:
+      Fn::GetAtt: FunctionRole.Arn
+  ExperimentTemplateId:
+    Value:
+      Ref: ExperimentTemplate
+  StopConditionAlarmName:
+    Value:
+      Ref: StopConditionAlarm
+  StatePath:
+    Value:
+      Fn::Sub: /aem-opencloud/${EngineStackPrefix}/chaos-engine/kills

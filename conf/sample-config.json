@@ -1,0 +1,40 @@
+{
+  "enabled": true,
+  "dryRun": false,
+  "timezone": "Australia/Sydney",
+  "dailyProbability": 1.0,
+  "runsPerDay": 6,
+  "retentionDays": 7,
+  "cloudFormationStackName": "sandpit-aem-full-set-main-stack",
+  "orchestratorAsgName": "sandpit-orchestrator-asg",
+  "stopConditionAlarmNames": [
+    "sandpit-ChaosEngine-PublishDispatcher-UnHealthyHostsAlarm",
+    "sandpit-ChaosEngine-AuthorDispatcher-UnHealthyHostsAlarm"
+  ],
+  "targets": [
+    {
+      "component": "author-dispatcher",
+      "enabled": true,
+      "asgName": "sandpit-author-dispatcher-asg",
+      "fisTemplateId": "EXTAUTHORDISPATCHER",
+      "weight": 1,
+      "minInService": 2
+    },
+    {
+      "component": "publish",
+      "enabled": true,
+      "asgName": "sandpit-publish-asg",
+      "fisTemplateId": "EXTPUBLISH",
+      "weight": 1,
+      "minInService": 2
+    },
+    {
+      "component": "publish-dispatcher",
+      "enabled": true,
+      "asgName": "sandpit-publish-dispatcher-asg",
+      "fisTemplateId": "EXTPUBLISHDISPATCHER",
+      "weight": 1,
+      "minInService": 2
+    }
+  ]
+}

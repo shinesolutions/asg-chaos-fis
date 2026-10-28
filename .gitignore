@@ -1,0 +1,8 @@
+.DS_Store
+.idea/
+.venv/
+logs/
+stage/
+__pycache__
+.pytest_cache
+test/integration/integration.env

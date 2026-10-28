@@ -1,0 +1,10 @@
+[MAIN]
+init-hook = import sys; sys.path[0:0] = ['lambda', 'test']
+
+[FORMAT]
+max-line-length = 120
+
+[MESSAGES CONTROL]
+disable =
+    # pytest fixtures are injected by parameter name
+    redefined-outer-name,
