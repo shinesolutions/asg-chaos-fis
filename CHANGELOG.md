@@ -14,7 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Configuration `schemaVersion`, so that a configuration for another version fails the invocation
 - Pre-checks for stack stability (optional), Auto Scaling Group health and active experiments
 - Pre-checks that Auto Scaling Group instances are running in EC2 and past the health check grace period
-- Pre-checks that the target Auto Scaling Group has no instance in another lifecycle state, and that FIS can only select its healthy InService instances
+- Pre-checks that the target Auto Scaling Group has no instance in another lifecycle state, and that the instances FIS can select are exactly its healthy InService instances
 - Pre-checks of each target's `requiredHealthy` Auto Scaling Groups
 - Target tags and stop condition alarms read from each target's FIS experiment template, and a pre-check that skips templates whose selection the pre-checks cannot fully cover
 - Pre-check that the stop condition alarms are OK before the day is claimed

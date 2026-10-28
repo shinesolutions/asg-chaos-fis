@@ -377,6 +377,20 @@ def test_skips_when_a_running_instance_with_the_template_tags_is_outside_the_asg
     assert run()['reason'] == 'PRECHECK_TARGET_ASG_UNMANAGED_INSTANCE'
 
 
+@pytest.mark.parametrize('ids', [['i-00000000000000000'], []], ids=['one-untagged', 'none-tagged'])
+def test_skips_without_claiming_when_a_healthy_asg_member_lacks_the_template_tags(aws, rng, ids):
+    # FIS could never pick an untagged member, and with no match at all it would fail after the day is claimed.
+    rng(HIT, choice_value('web'))
+    aws.config(make_config())
+    aws.claims([])
+    aws.stack()
+    aws.template('web')
+    aws.asg(asg_name('web'))
+    aws.ec2_instances()
+    aws.fis_targets(resource_tags('web'), ids=ids)
+    assert run()['reason'] == 'PRECHECK_TARGET_ASG_UNTAGGED_INSTANCE'
+
+
 def test_unmanaged_instance_check_uses_every_template_tag(aws, rng):
     rng(HIT, choice_value('web'))
     aws.config(make_config(dryRun=True))

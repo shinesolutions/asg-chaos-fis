@@ -22,7 +22,7 @@ Safety guardrails
   * the CloudFormation stack in `cloudFormationStackName`, if set, is in a stable `*_COMPLETE` state
   * the target Auto Scaling Group has all desired instances healthy and InService, at least `minInService` of them, **no instance in any other state** (for example `Standby`, which may not count towards the desired capacity), and no scaling activity in progress
   * every one of those instances is running in EC2, and was launched longer ago than the Auto Scaling Group's health check grace period. The Auto Scaling Group's own view lags behind: it notices a terminated instance only after about a minute, and it reports new instances as healthy without checking them during the grace period
-  * every running instance that FIS could select (by all of the template's target tags) is one of those instances. This catches, for example, an instance detached from the Auto Scaling Group but still running
+  * the running instances that FIS could select (by all of the template's target tags) are exactly those instances. This catches, for example, an instance detached from the Auto Scaling Group but still running, and an Auto Scaling Group member without the tags, which FIS could never select. A template that matches no instance at all is skipped too, instead of failing after the day has been claimed
   * every Auto Scaling Group in the target's `requiredHealthy` list passes the same checks, with its own `minInService`. Use this when a termination affects other Auto Scaling Groups too, for example when another component replaces a paired instance
   * every stop condition alarm of the target's template is `OK`. FIS also refuses to run an experiment whose stop condition is not `OK`, but only after the day has been claimed, so checking first lets a later run that day try again. Stop conditions only stop an experiment from starting: a terminate action finishes in seconds, so they cannot stop one in progress
   * no experiment from the configured templates is still active
@@ -57,7 +57,7 @@ The probability roll works like Simian Army's: `dailyProbability` is spread over
 * `1.0` means one termination attempt per day on average. With 6 runs per day, about 2 in 3 days see a termination.
 * A value equal to `runsPerDay` means the first run of each day that passes the pre-checks terminates an instance.
 
-The pre-check reasons are `PRECHECK_STACK_NOT_FOUND`, `PRECHECK_STACK_NOT_STABLE`, `PRECHECK_FIS_TEMPLATE_NOT_FOUND`, `PRECHECK_FIS_TEMPLATE_UNSUPPORTED`, `PRECHECK_TARGET_ASG_*` and `PRECHECK_REQUIRED_ASG_*` (`NOT_FOUND`, `DEGRADED`, `BELOW_MIN_IN_SERVICE`, `INSTANCE_NOT_IN_SERVICE`, `INSTANCE_NOT_RUNNING`, `IN_GRACE_PERIOD`, `SCALING_IN_PROGRESS`, and for the target only `UNMANAGED_INSTANCE`), `PRECHECK_STOP_CONDITION_ALARM`, `PRECHECK_STOP_CONDITION_ALARM_NOT_FOUND` and `PRECHECK_EXPERIMENT_ACTIVE`.
+The pre-check reasons are `PRECHECK_STACK_NOT_FOUND`, `PRECHECK_STACK_NOT_STABLE`, `PRECHECK_FIS_TEMPLATE_NOT_FOUND`, `PRECHECK_FIS_TEMPLATE_UNSUPPORTED`, `PRECHECK_TARGET_ASG_*` and `PRECHECK_REQUIRED_ASG_*` (`NOT_FOUND`, `DEGRADED`, `BELOW_MIN_IN_SERVICE`, `INSTANCE_NOT_IN_SERVICE`, `INSTANCE_NOT_RUNNING`, `IN_GRACE_PERIOD`, `SCALING_IN_PROGRESS`, and for the target only `UNMANAGED_INSTANCE` and `UNTAGGED_INSTANCE`), `PRECHECK_STOP_CONDITION_ALARM`, `PRECHECK_STOP_CONDITION_ALARM_NOT_FOUND` and `PRECHECK_EXPERIMENT_ACTIVE`.
 
 Configuration
 -------------
@@ -107,7 +107,7 @@ Each target's template must:
 * have exactly one target, with `resourceType` `aws:ec2:instance`, `resourceTags`, `selectionMode` `COUNT(1)`, a single `State.Name` filter with the value `running`, and no `resourceArns`
 * only have stop conditions from `aws:cloudwatch:alarm`, or none
 
-The instances with the target tags should be exactly the Auto Scaling Group's instances. The `UNMANAGED_INSTANCE` pre-check skips the run if they are not.
+The instances with the target tags must be exactly the Auto Scaling Group's instances, for example by propagating the tags from the Auto Scaling Group at launch. The `UNMANAGED_INSTANCE` and `UNTAGGED_INSTANCE` pre-checks skip the run if they are not.
 
 ### Invocation event
 

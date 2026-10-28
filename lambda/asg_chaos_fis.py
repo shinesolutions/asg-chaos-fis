@@ -25,8 +25,8 @@ Safety guardrails:
 * Pre-checks before every termination: the CloudFormation stack, if
   configured, is stable; the target Auto Scaling Group is fully healthy with
   enough InService instances, all of them running in EC2 and past the health
-  check grace period, no other instance in it, no running instance with the
-  template's target tags outside it, and no scaling activity in progress; the
+  check grace period, no other instance in it, exactly its instances running
+  with the template's target tags, and no scaling activity in progress; the
   target's required Auto Scaling Groups pass the same checks; the template's
   stop condition alarms are OK; and no experiment of the configured templates
   is active.
@@ -508,11 +508,14 @@ def check_instances_settled(instance_ids: list[str], grace_period: int, label: s
 
 def check_fis_targets_in_asg(resource_tags: dict[str, str], asg_instance_ids: set[str]) -> str | None:
     """
-    Fail if FIS could pick a running instance that is not a healthy InService member of the ASG.
+    Fail unless the instances FIS can pick are exactly the healthy InService members of the ASG.
 
     FIS selects any running instance with all of the template's target tags, so
     this covers exactly what it can terminate, e.g. an instance that was
-    detached from the Auto Scaling Group but is still running.
+    detached from the Auto Scaling Group but is still running. The other way
+    round, an ASG member without the tags could never be picked, and a
+    template that matches no instance at all would fail only after the day has
+    been claimed.
     """
     paginator = _client('ec2').get_paginator('describe_instances')
     filters = [{'Name': f'tag:{key}', 'Values': [value]} for key, value in sorted(resource_tags.items())]
@@ -524,6 +527,11 @@ def check_fis_targets_in_asg(resource_tags: dict[str, str], asg_instance_ids: se
         logger.info('Running instances with tags %s outside the healthy ASG members: %s',
                     resource_tags, ', '.join(outside))
         return 'PRECHECK_TARGET_ASG_UNMANAGED_INSTANCE'
+    untagged = sorted(asg_instance_ids - running)
+    if untagged:
+        logger.info('Healthy ASG members without the tags %s, which FIS cannot pick: %s',
+                    resource_tags, ', '.join(untagged))
+        return 'PRECHECK_TARGET_ASG_UNTAGGED_INSTANCE'
     return None
 
 
