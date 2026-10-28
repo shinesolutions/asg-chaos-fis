@@ -1,10 +1,14 @@
 # -*- coding: utf8 -*-
 
 """
-Shared fixtures for the AEM Chaos Engine tests.
+Shared fixtures for the ASG Chaos FIS tests.
 
 AWS calls are intercepted with botocore Stubbers, which also validate request
 parameters and responses against the real AWS API models.
+
+The example application has three targets: ``web`` on its own, and ``api`` and
+``worker``, which each require the other one and a ``coordinator`` Auto
+Scaling Group to be healthy before a termination.
 """
 
 # pylint: disable=missing-function-docstring
@@ -18,35 +22,57 @@ import boto3
 import pytest
 from botocore.stub import ANY, Stubber
 
-import aem_chaos_engine as engine
+import asg_chaos_fis as engine
 
-STACK_PREFIX = 'sandpit'
-CONFIG_PARAMETER_NAME = f'/aem-opencloud/{STACK_PREFIX}/chaos-engine/config'
-STATE_PARAMETER_PATH = f'/aem-opencloud/{STACK_PREFIX}/chaos-engine/kills'
-STACK_NAME = f'{STACK_PREFIX}-aem-full-set-main-stack'
+APP = 'demo'
+CONFIG_PARAMETER_NAME = f'/{APP}/chaos/config'
+STATE_PARAMETER_PATH = f'/{APP}/chaos/kills'
+STACK_NAME = f'{APP}-main-stack'
+REGION = 'ap-southeast-2'
+ACCOUNT = '123456789012'
 NOW = datetime(2026, 10, 14, 10, 5, tzinfo=ZoneInfo('Australia/Sydney'))
 TODAY = NOW.date().isoformat()
 SCHEDULED_TIME = '2026-10-13T23:00:00Z'
 GRACE_PERIOD = 300
 LONG_AGO = NOW - timedelta(days=1)
-STOP_CONDITION_ALARMS = [
-    f'{STACK_PREFIX}-ChaosEngine-PublishDispatcher-UnHealthyHostsAlarm',
-    f'{STACK_PREFIX}-ChaosEngine-AuthorDispatcher-UnHealthyHostsAlarm',
-]
+STOP_CONDITION_ALARMS = [f'{APP}-web-UnHealthyHostsAlarm', f'{APP}-api-UnHealthyHostsAlarm']
 
 TEMPLATE_IDS = {
-    'author-dispatcher': 'EXTAUTHORDISPATCHER',
-    'publish': 'EXTPUBLISH',
-    'publish-dispatcher': 'EXTPUBLISHDISPATCHER',
+    'web': 'EXTWEB',
+    'api': 'EXTAPI',
+    'worker': 'EXTWORKER',
 }
 
 
-def asg_name(component):
-    return f'{STACK_PREFIX}-{component}-asg'
+def asg_name(name):
+    return f'{APP}-{name}-asg'
+
+
+REQUIRED_HEALTHY = {
+    'web': [],
+    'api': [
+        {'asgName': asg_name('worker'), 'minInService': 2},
+        {'asgName': asg_name('coordinator'), 'minInService': 1},
+    ],
+    'worker': [
+        {'asgName': asg_name('api'), 'minInService': 2},
+        {'asgName': asg_name('coordinator'), 'minInService': 1},
+    ],
+}
+
+
+def resource_tags(name):
+    """The FIS template's target tags for ``name``."""
+    return {'App': APP, 'Role': name}
+
+
+def alarm_arn(name):
+    return f'arn:aws:cloudwatch:{REGION}:{ACCOUNT}:alarm:{name}'
 
 
 def make_config(**overrides):
     config = {
+        'schemaVersion': 1,
         'enabled': True,
         'dryRun': False,
         'timezone': 'Australia/Sydney',
@@ -54,15 +80,36 @@ def make_config(**overrides):
         'runsPerDay': 6,
         'retentionDays': 7,
         'cloudFormationStackName': STACK_NAME,
-        'orchestratorAsgName': asg_name('orchestrator'),
-        'stopConditionAlarmNames': STOP_CONDITION_ALARMS,
+        'metricNamespace': 'Demo/Chaos',
+        'metricDimensions': {'App': APP},
+        'experimentTags': {'App': APP},
         'targets': [
-            {'component': component, 'asgName': asg_name(component), 'fisTemplateId': template_id}
-            for component, template_id in TEMPLATE_IDS.items()
+            {'name': name, 'asgName': asg_name(name), 'fisTemplateId': template_id,
+             'requiredHealthy': REQUIRED_HEALTHY[name]}
+            for name, template_id in TEMPLATE_IDS.items()
         ],
     }
     config.update(overrides)
     return config
+
+
+def make_template(name, **overrides):
+    """A supported FIS experiment template for ``name``; ``overrides`` replace members of its single target."""
+    target = {
+        'resourceType': 'aws:ec2:instance',
+        'resourceTags': resource_tags(name),
+        'filters': [{'path': 'State.Name', 'values': ['running']}],
+        'selectionMode': 'COUNT(1)',
+    }
+    target.update(overrides)
+    return {
+        'id': TEMPLATE_IDS[name],
+        'targets': {'Instances': target},
+        'actions': {'TerminateInstance': {'actionId': 'aws:ec2:terminate-instances',
+                                          'targets': {'Instances': 'Instances'}}},
+        'stopConditions': [{'source': 'aws:cloudwatch:alarm', 'value': alarm_arn(alarm)}
+                           for alarm in STOP_CONDITION_ALARMS],
+    }
 
 
 class SequenceRandom(random.Random):
@@ -76,9 +123,9 @@ class SequenceRandom(random.Random):
         return self.values.pop(0)
 
 
-def choice_value(component):
-    """random() value that makes choices() pick ``component`` from the default equal-weight targets."""
-    index = list(TEMPLATE_IDS).index(component)
+def choice_value(name):
+    """random() value that makes choices() pick ``name`` from the default equal-weight targets."""
+    index = list(TEMPLATE_IDS).index(name)
     return (index + 0.5) / len(TEMPLATE_IDS)
 
 
@@ -87,7 +134,7 @@ class Aws:
 
     def __init__(self):
         credentials = {
-            'region_name': 'ap-southeast-2',
+            'region_name': REGION,
             'aws_access_key_id': 'testing',
             'aws_secret_access_key': 'testing',
         }
@@ -128,6 +175,11 @@ class Aws:
             {'StackName': STACK_NAME},
         )
 
+    def template(self, name, template=None):
+        template = template or make_template(name)
+        self.fis.add_response('get_experiment_template', {'experimentTemplate': template},
+                              {'id': TEMPLATE_IDS[name]})
+
     def asg(self, name, desired=2, healthy=2, unhealthy=0, other_states=()):
         """An ASG with healthy, then unhealthy InService instances, then one instance per other lifecycle state."""
         states = [('InService', 'Healthy')] * healthy + [('InService', 'Unhealthy')] * unhealthy
@@ -135,7 +187,7 @@ class Aws:
         instances = [
             {
                 'InstanceId': f'i-{index:017d}',
-                'AvailabilityZone': 'ap-southeast-2a',
+                'AvailabilityZone': f'{REGION}a',
                 'LifecycleState': lifecycle,
                 'HealthStatus': health,
                 'ProtectedFromScaleIn': False,
@@ -150,7 +202,7 @@ class Aws:
                 'MaxSize': 4,
                 'DesiredCapacity': desired,
                 'DefaultCooldown': 300,
-                'AvailabilityZones': ['ap-southeast-2a'],
+                'AvailabilityZones': [f'{REGION}a'],
                 'HealthCheckType': 'ELB',
                 'HealthCheckGracePeriod': GRACE_PERIOD,
                 'CreatedTime': datetime(2026, 1, 1, tzinfo=timezone.utc),
@@ -173,17 +225,14 @@ class Aws:
             {'InstanceIds': ids},
         )
 
-    def fis_targets(self, component, ids=None):
-        """Running instances with the target tags, as FIS would select them (default: the 2 healthy ones)."""
+    def fis_targets(self, tags, ids=None):
+        """Running instances with the template's target tags, as FIS would select them (default: the 2 healthy ones)."""
         ids = [f'i-{index:017d}' for index in range(2)] if ids is None else ids
+        filters = [{'Name': f'tag:{key}', 'Values': [value]} for key, value in sorted(tags.items())]
         self.ec2.add_response(
             'describe_instances',
             {'Reservations': [{'Instances': [{'InstanceId': instance_id} for instance_id in ids]}]},
-            {'Filters': [
-                {'Name': 'tag:StackPrefix', 'Values': [STACK_PREFIX]},
-                {'Name': 'tag:Component', 'Values': [component]},
-                {'Name': 'instance-state-name', 'Values': ['running']},
-            ]},
+            {'Filters': [*filters, {'Name': 'instance-state-name', 'Values': ['running']}]},
         )
 
     def activities(self, name, statuses=('Successful',)):
@@ -202,12 +251,12 @@ class Aws:
             {'AutoScalingGroupName': name, 'MaxRecords': 10},
         )
 
-    def healthy_asg(self, name, component=None):
-        """A passing ASG check; ``component`` makes it the target ASG, whose FIS targets are checked too."""
+    def healthy_asg(self, name, tags=None):
+        """A passing ASG check; ``tags`` makes it the target ASG, whose FIS targets are checked too."""
         self.asg(name)
         self.ec2_instances()
-        if component:
-            self.fis_targets(component)
+        if tags:
+            self.fis_targets(tags)
         self.activities(name)
 
     def alarms(self, states=None, names=None):
@@ -233,13 +282,16 @@ class Aws:
             if active:
                 return
 
-    def passing_prechecks(self, component):
+    def target_ready(self, name):
+        """Passing checks up to and including the target ASG."""
         self.stack()
-        self.healthy_asg(asg_name(component), component)
-        partner = engine.PAIRED_COMPONENTS.get(component)
-        if partner:
-            self.healthy_asg(asg_name(partner))
-            self.healthy_asg(asg_name('orchestrator'))
+        self.template(name)
+        self.healthy_asg(asg_name(name), resource_tags(name))
+
+    def passing_prechecks(self, name):
+        self.target_ready(name)
+        for required in REQUIRED_HEALTHY[name]:
+            self.healthy_asg(required['asgName'])
         self.alarms()
         self.experiments()
 
@@ -266,7 +318,6 @@ class Aws:
 
 @pytest.fixture(autouse=True)
 def environment(monkeypatch):
-    monkeypatch.setenv('STACK_PREFIX', STACK_PREFIX)
     monkeypatch.setenv('CONFIG_PARAMETER_NAME', CONFIG_PARAMETER_NAME)
     monkeypatch.setenv('STATE_PARAMETER_PATH', STATE_PARAMETER_PATH)
     monkeypatch.setattr(engine, '_now', NOW.astimezone)

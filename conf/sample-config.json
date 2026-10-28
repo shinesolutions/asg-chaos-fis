@@ -1,40 +1,39 @@
 {
+  "schemaVersion": 1,
   "enabled": true,
   "dryRun": false,
   "timezone": "Australia/Sydney",
   "dailyProbability": 1.0,
   "runsPerDay": 6,
   "retentionDays": 7,
-  "cloudFormationStackName": "sandpit-aem-full-set-main-stack",
-  "orchestratorAsgName": "sandpit-orchestrator-asg",
-  "stopConditionAlarmNames": [
-    "sandpit-ChaosEngine-PublishDispatcher-UnHealthyHostsAlarm",
-    "sandpit-ChaosEngine-AuthorDispatcher-UnHealthyHostsAlarm"
-  ],
+  "cloudFormationStackName": "demo-main-stack",
+  "metricNamespace": "Demo/Chaos",
+  "metricDimensions": {
+    "App": "demo"
+  },
+  "experimentTags": {
+    "App": "demo"
+  },
   "targets": [
     {
-      "component": "author-dispatcher",
+      "name": "web",
       "enabled": true,
-      "asgName": "sandpit-author-dispatcher-asg",
-      "fisTemplateId": "EXTAUTHORDISPATCHER",
+      "asgName": "demo-web-asg",
+      "fisTemplateId": "EXTWEB",
       "weight": 1,
       "minInService": 2
     },
     {
-      "component": "publish",
+      "name": "api",
       "enabled": true,
-      "asgName": "sandpit-publish-asg",
-      "fisTemplateId": "EXTPUBLISH",
+      "asgName": "demo-api-asg",
+      "fisTemplateId": "EXTAPI",
       "weight": 1,
-      "minInService": 2
-    },
-    {
-      "component": "publish-dispatcher",
-      "enabled": true,
-      "asgName": "sandpit-publish-dispatcher-asg",
-      "fisTemplateId": "EXTPUBLISHDISPATCHER",
-      "weight": 1,
-      "minInService": 2
+      "minInService": 2,
+      "requiredHealthy": [
+        {"asgName": "demo-worker-asg", "minInService": 2},
+        {"asgName": "demo-coordinator-asg", "minInService": 1}
+      ]
     }
   ]
 }

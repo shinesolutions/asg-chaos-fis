@@ -1,26 +1,26 @@
 Integration tests
 -----------------
 
-These tests run the chaos engine against real AWS services before it is deployed with aem-aws-stack-builder. They deploy a throwaway harness stack ([harness.yaml](harness.yaml)) that points the engine at an existing **non-AEM** test Auto Scaling Group, then invoke the Lambda and check the results.
+These tests run ASG Chaos FIS against real AWS services before it is released. They deploy a throwaway harness stack ([harness.yaml](harness.yaml)) that points the engine at an existing test Auto Scaling Group, then invoke the Lambda and check the results. The test Auto Scaling Group must not belong to an application such as AEM OpenCloud.
 
 The `kill` step terminates one instance of the test Auto Scaling Group. Every other step terminates nothing.
 
 ### What the harness creates
 
-* The chaos engine Lambda, with no retries. The stack creates it with placeholder code; `deploy` then uploads the locally built zip straight to the function, so no S3 bucket is needed
+* The ASG Chaos FIS Lambda, with no retries. The stack creates it with placeholder code; `deploy` then uploads the locally built zip straight to the function, so no S3 bucket is needed
 * A FIS experiment template that terminates one running instance tagged with **both** the target `StackPrefix` and `Component`
 * A stop condition alarm on the test load balancer's `UnHealthyHostCount`
 * IAM roles for the Lambda, FIS and, during the scheduler test, EventBridge Scheduler
-* The engine configuration in SSM, at `/aem-opencloud/<ENGINE_STACK_PREFIX>/chaos-engine/config`
+* The engine configuration in SSM, at `/asg-chaos-fis/<ENGINE_NAME>/config`. Its single target lists its own Auto Scaling Group under `requiredHealthy`, so that the required Auto Scaling Group check can be tested without a second one
 
 ### Safety guards
 
-The engine labels the target `author-dispatcher` in its configuration, because it only accepts AEM component names. The label is only used for validation, logs and tags. **Which instances can be terminated is decided by FIS and IAM, never by the label:**
+The target is named `integration-test` in the configuration. The name is only used for logs, claims and tags. **Which instances can be terminated is decided by FIS and IAM, never by the name:**
 
 1. The FIS template only selects instances that have both target tags.
 2. The FIS role may only terminate instances that have both target tags. Even a wrong template would be refused by IAM.
-3. The Lambda role may only start the harness experiment template.
-4. `preflight`, which also runs before `deploy` and `kill`, stops if `TARGET_COMPONENT` is an AEM component name, or if any instance with the target tags is outside the test Auto Scaling Group.
+3. The Lambda role may only read and start the harness experiment template.
+4. `preflight`, which also runs before `deploy` and `kill`, stops if `TARGET_COMPONENT` is an AEM OpenCloud component name, or if any instance with the target tags is outside the test Auto Scaling Group.
 5. `kill` asks you to type `TERMINATE` before it continues.
 
 The `iam` step checks guards 2 and 3 with the IAM policy simulator.
@@ -44,7 +44,7 @@ Fill in `test/integration/integration.env`. The file is ignored by git.
 |---------|-------------|
 | `AWS_REGION` | Region of the test Auto Scaling Group |
 | `HARNESS_STACK_NAME` | Name of the harness stack |
-| `ENGINE_STACK_PREFIX` | Stack prefix the engine runs as. Must not be the prefix of a real stack |
+| `ENGINE_NAME` | Name the engine runs as: function `<ENGINE_NAME>-asg-chaos-fis`, SSM path `/asg-chaos-fis/<ENGINE_NAME>/` |
 | `TARGET_STACK_PREFIX`, `TARGET_COMPONENT` | Tags of the instances that may be terminated |
 | `TARGET_ASG_NAME` | Full name of the test Auto Scaling Group |
 | `TARGET_STACK_NAME` | CloudFormation stack of the test Auto Scaling Group |
@@ -68,16 +68,17 @@ Run the steps one at a time from the repository root, in this order. Each step p
 
 ### What each step checks
 
-**preflight**: you are logged in; the target is not an AEM component; every instance with the target tags belongs to the test Auto Scaling Group. Lists the instances that may be terminated.
+**preflight**: you are logged in; the target is not an AEM OpenCloud component; every instance with the target tags belongs to the test Auto Scaling Group. Lists the instances that may be terminated.
 
-**deploy**: packages `lambda/aem_chaos_engine.py`, deploys the harness in dry run mode, uploads the zip straight to the function (`aws lambda update-function-code`), and checks that the deployed code matches the local zip. Run `deploy` again after changing the Lambda code. Later stack updates by the other steps leave the uploaded code in place.
+**deploy**: packages `lambda/asg_chaos_fis.py`, deploys the harness in dry run mode, uploads the zip straight to the function (`aws lambda update-function-code`), and checks that the deployed code matches the local zip. Run `deploy` again after changing the Lambda code. Later stack updates by the other steps leave the uploaded code in place.
 
-**iam**: the FIS role can terminate an instance with the target tags, but not one with another `Component`, another `StackPrefix` or no tags. The Lambda role can start the harness template only, cannot terminate instances itself, and can read the stop condition alarm.
+**iam**: the FIS role can terminate an instance with the target tags, but not one with another `Component`, another `StackPrefix` or no tags. The Lambda role can read and start the harness template only, cannot terminate instances itself, and can read the stop condition alarm.
 
 **dry-run**: first waits until the test Auto Scaling Group is healthy in both the Auto Scaling Group and the load balancer, and past the health check grace period. This can take up to 20 minutes if an instance was replaced recently. Then:
 * A dry run returns `DRY_RUN` / `WOULD_TERMINATE`, claims nothing and terminates nothing.
 * With `MinInService` raised to 3, the pre-check returns `PRECHECK_TARGET_ASG_BELOW_MIN_IN_SERVICE`.
-* With the stop condition alarm forced into `ALARM`, the engine returns `PRECHECK_STOP_CONDITION_ALARM` and does not claim the day.
+* With the required Auto Scaling Group's `minInService` raised to 3, the pre-check returns `PRECHECK_REQUIRED_ASG_BELOW_MIN_IN_SERVICE`.
+* With the stop condition alarm forced into `ALARM`, the engine returns `PRECHECK_STOP_CONDITION_ALARM` and does not claim the day. The engine reads the alarm from the experiment template's stop conditions.
 
 **scheduler**: creates a one-off EventBridge Scheduler schedule 4 minutes ahead and checks that the engine is invoked with the scheduled time as input.
 

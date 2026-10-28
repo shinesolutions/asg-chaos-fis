@@ -1,6 +1,6 @@
 .DS_Store
 .idea/
-.venv/
+.venv
 logs/
 stage/
 __pycache__

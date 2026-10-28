@@ -1,13 +1,18 @@
 # -*- coding: utf8 -*-
 
 """
-AEM Chaos Engine.
+ASG Chaos FIS.
 
-Serverless replacement for the Simian Army Chaos Monkey used by AEM OpenCloud
-full-set stacks. An Amazon EventBridge Scheduler schedule invokes this Lambda
-several times per business day. Each invocation decides whether to terminate
-one instance from one of the configured Auto Scaling Groups and, if so, starts
-the matching AWS Fault Injection Service (FIS) experiment template.
+Terminates, at most once per day, one random instance of one of the configured
+Auto Scaling Groups, using an AWS Fault Injection Service (FIS) experiment
+template. A scheduler such as Amazon EventBridge Scheduler invokes the Lambda
+several times per day. Each invocation decides whether to start an experiment
+and, if so, which target's.
+
+The library only knows about Auto Scaling Groups and FIS experiment templates.
+Everything specific to the application, such as which Auto Scaling Groups may
+be targeted and which others must be healthy first, comes from the JSON
+configuration.
 
 Safety guardrails:
 
@@ -15,16 +20,16 @@ Safety guardrails:
   is claimed by creating an SSM parameter with ``Overwrite=False``, which is
   atomic, BEFORE FIS is called. The claim is kept even if FIS fails, so a
   failure or a duplicate invocation can never cause a second termination.
-* Only the ``author-dispatcher``, ``publish`` and ``publish-dispatcher`` Auto
-  Scaling Groups can be targeted.
-* Pre-checks before every termination: the CloudFormation stack is stable; the
-  target Auto Scaling Group is fully healthy with enough InService instances,
-  all of them running in EC2 and past the health check grace period, no other
-  instance in it, no running instance with its tags outside it, and no scaling
-  activity in progress; for publish and publish-dispatcher, whose pair the
-  orchestrator terminates together, the paired Auto Scaling Group and the
-  orchestrator are healthy too; the stop condition alarms are OK; and no
-  experiment of this engine is active.
+* Each target's FIS experiment template must select exactly one running
+  instance by tags. Other templates are not used.
+* Pre-checks before every termination: the CloudFormation stack, if
+  configured, is stable; the target Auto Scaling Group is fully healthy with
+  enough InService instances, all of them running in EC2 and past the health
+  check grace period, no other instance in it, no running instance with the
+  template's target tags outside it, and no scaling activity in progress; the
+  target's required Auto Scaling Groups pass the same checks; the template's
+  stop condition alarms are OK; and no experiment of the configured templates
+  is active.
 """
 
 from __future__ import annotations
@@ -51,14 +56,23 @@ __license__ = 'Apache License, Version 2.0'
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv('LOG_LEVEL', 'INFO').upper())
 
-ALLOWED_COMPONENTS = frozenset({'author-dispatcher', 'publish', 'publish-dispatcher'})
-# When one instance of a publish / publish-dispatcher pair is terminated, the
-# AEM orchestrator terminates the other one too.
-PAIRED_COMPONENTS = {'publish': 'publish-dispatcher', 'publish-dispatcher': 'publish'}
+SCHEMA_VERSION = 1
 DEFAULT_MIN_IN_SERVICE = 2
+DEFAULT_REQUIRED_MIN_IN_SERVICE = 1
 DEFAULT_RETENTION_DAYS = 7
-TRIGGERED_BY = 'aem-chaos-engine'
-METRIC_NAMESPACE = 'AEMOpenCloud/ChaosEngine'
+DEFAULT_METRIC_NAMESPACE = 'ASGChaosFIS'
+TRIGGERED_BY = 'asg-chaos-fis'
+
+# Tags the library adds to every experiment, and the limits FIS sets on tags.
+FIXED_EXPERIMENT_TAG_KEYS = frozenset({'ChaosTarget', 'TriggeredBy', 'LocalDate'})
+MAX_EXPERIMENT_TAGS = 50 - len(FIXED_EXPERIMENT_TAG_KEYS)
+# Members of the decision record that metric dimensions must not overwrite.
+RESERVED_RECORD_KEYS = frozenset({
+    '_aws', 'Status', 'Reason', 'Decisions',
+    'localDate', 'scheduledTime', 'roll', 'threshold', 'target', 'asgName', 'experimentId', 'error',
+})
+# CloudWatch allows 30 dimensions per metric; Status or Reason is always added.
+MAX_METRIC_DIMENSIONS = 29
 
 STABLE_STACK_STATUSES = frozenset({
     'CREATE_COMPLETE',
@@ -98,7 +112,6 @@ class ConfigurationError(Exception):
 class Settings:
     """Deployment settings passed in as Lambda environment variables."""
 
-    stack_prefix: str
     config_parameter_name: str
     state_parameter_path: str
 
@@ -106,27 +119,35 @@ class Settings:
     def from_env(cls, environ: Any = None) -> Settings:
         """Read settings from the environment, failing fast if any are missing."""
         environ = os.environ if environ is None else environ
-        names = ('STACK_PREFIX', 'CONFIG_PARAMETER_NAME', 'STATE_PARAMETER_PATH')
+        names = ('CONFIG_PARAMETER_NAME', 'STATE_PARAMETER_PATH')
         missing = [name for name in names if not environ.get(name)]
         if missing:
             raise ConfigurationError(f"Missing required environment variables: {', '.join(missing)}")
         return cls(
-            stack_prefix=environ['STACK_PREFIX'],
             config_parameter_name=environ['CONFIG_PARAMETER_NAME'],
             state_parameter_path=environ['STATE_PARAMETER_PATH'].rstrip('/'),
         )
 
 
 @dataclass(frozen=True)
-class Target:
+class RequiredAsg:
+    """An Auto Scaling Group that must be healthy before the target is terminated."""
+
+    asg_name: str
+    min_in_service: int
+
+
+@dataclass(frozen=True)
+class Target:  # pylint: disable=too-many-instance-attributes
     """An Auto Scaling Group that may have one of its instances terminated."""
 
-    component: str
+    name: str
     enabled: bool
     asg_name: str
     fis_template_id: str
     weight: float
     min_in_service: int
+    required_healthy: tuple[RequiredAsg, ...]
 
 
 @dataclass(frozen=True)
@@ -139,15 +160,12 @@ class EngineConfig:  # pylint: disable=too-many-instance-attributes
     daily_probability: float
     runs_per_day: int
     retention_days: int
-    cloudformation_stack_name: str
-    orchestrator_asg_name: str | None
-    stop_condition_alarm_names: tuple[str, ...]
+    cloudformation_stack_name: str | None
+    metric_namespace: str
+    metric_dimensions: dict[str, str]
+    experiment_tags: dict[str, str]
     targets: tuple[Target, ...]
     all_targets: tuple[Target, ...]
-
-    def asg_name(self, component: str) -> str:
-        """Auto Scaling Group of a configured component, enabled or not."""
-        return next(target.asg_name for target in self.all_targets if target.component == component)
 
     @property
     def run_probability(self) -> float:
@@ -160,6 +178,14 @@ class EngineConfig:  # pylint: disable=too-many-instance-attributes
         limit is reached.
         """
         return min(1.0, self.daily_probability / self.runs_per_day)
+
+
+@dataclass(frozen=True)
+class TemplateTarget:
+    """What a supported FIS experiment template can select and must check before it runs."""
+
+    resource_tags: dict[str, str]
+    stop_condition_alarm_names: tuple[str, ...]
 
 
 def _field(raw: dict, key: str, kind: type, default: Any = _REQUIRED, where: str = '') -> Any:
@@ -184,36 +210,74 @@ def _field(raw: dict, key: str, kind: type, default: Any = _REQUIRED, where: str
     return value
 
 
+def _string_map(raw: dict, key: str, max_items: int,  # pylint: disable=too-many-arguments,too-many-positional-arguments
+                reserved: frozenset[str], key_length: int, value_length: int) -> dict[str, str]:
+    """Return ``raw[key]`` as a dict of non-empty strings, or {} if absent."""
+    value = raw.get(key, {})
+    valid = (isinstance(value, dict) and len(value) <= max_items
+             and all(isinstance(k, str) and 0 < len(k) <= key_length and not k.lower().startswith('aws:')
+                     and isinstance(v, str) and 0 < len(v) <= value_length for k, v in value.items()))
+    if not valid:
+        raise ConfigurationError(
+            f"Config field '{key}' must be an object of up to {max_items} non-empty strings "
+            f"(keys up to {key_length} characters and not starting with 'aws:', values up to {value_length})"
+        )
+    clashes = sorted(reserved.intersection(value))
+    if clashes:
+        raise ConfigurationError(f"Config field '{key}' must not contain {', '.join(clashes)}, which the engine sets")
+    return dict(value)
+
+
+def _parse_required_asg(raw: Any, where: str) -> RequiredAsg:
+    if not isinstance(raw, dict):
+        raise ConfigurationError(f"Config field '{where.rstrip('.')}' must be an object")
+    min_in_service = _field(raw, 'minInService', int, DEFAULT_REQUIRED_MIN_IN_SERVICE, where)
+    if min_in_service < 1:
+        raise ConfigurationError(f"Config field '{where}minInService' must be at least 1")
+    return RequiredAsg(asg_name=_field(raw, 'asgName', str, where=where), min_in_service=min_in_service)
+
+
 def _parse_target(raw: Any, index: int) -> Target:
     where = f'targets[{index}].'
     if not isinstance(raw, dict):
         raise ConfigurationError(f"Config field 'targets[{index}]' must be an object")
-    component = _field(raw, 'component', str, where=where)
-    if component not in ALLOWED_COMPONENTS:
-        raise ConfigurationError(
-            f"Config field '{where}component' is '{component}', "
-            f"but only {', '.join(sorted(ALLOWED_COMPONENTS))} can be targeted"
-        )
+    name = _field(raw, 'name', str, where=where)
+    if len(name) > 256:
+        raise ConfigurationError(f"Config field '{where}name' must be at most 256 characters")
     weight = _field(raw, 'weight', float, 1.0, where)
     if weight <= 0:
         raise ConfigurationError(f"Config field '{where}weight' must be greater than 0")
     min_in_service = _field(raw, 'minInService', int, DEFAULT_MIN_IN_SERVICE, where)
     if min_in_service < 1:
         raise ConfigurationError(f"Config field '{where}minInService' must be at least 1")
+    raw_required = raw.get('requiredHealthy', [])
+    if not isinstance(raw_required, list):
+        raise ConfigurationError(f"Config field '{where}requiredHealthy' must be a list")
     return Target(
-        component=component,
+        name=name,
         enabled=_field(raw, 'enabled', bool, True, where),
         asg_name=_field(raw, 'asgName', str, where=where),
         fis_template_id=_field(raw, 'fisTemplateId', str, where=where),
         weight=weight,
         min_in_service=min_in_service,
+        required_healthy=tuple(
+            _parse_required_asg(item, f'{where}requiredHealthy[{position}].')
+            for position, item in enumerate(raw_required)
+        ),
     )
 
 
-def parse_config(raw: Any) -> EngineConfig:  # pylint: disable=too-many-locals
+def parse_config(raw: Any) -> EngineConfig:
     """Validate the raw JSON configuration and convert it to an EngineConfig."""
     if not isinstance(raw, dict):
         raise ConfigurationError('Config must be a JSON object')
+
+    schema_version = _field(raw, 'schemaVersion', int)
+    if schema_version != SCHEMA_VERSION:
+        raise ConfigurationError(
+            f"Config field 'schemaVersion' is {schema_version}, but this version of the engine "
+            f"only supports {SCHEMA_VERSION}"
+        )
 
     enabled = _field(raw, 'enabled', bool)
 
@@ -235,35 +299,17 @@ def parse_config(raw: Any) -> EngineConfig:  # pylint: disable=too-many-locals
     if retention_days < 1:
         raise ConfigurationError("Config field 'retentionDays' must be at least 1")
 
-    orchestrator_asg_name = None
-    if raw.get('orchestratorAsgName') is not None:
-        orchestrator_asg_name = _field(raw, 'orchestratorAsgName', str)
-
-    alarm_names = raw.get('stopConditionAlarmNames', [])
-    if (not isinstance(alarm_names, list) or len(alarm_names) > 100
-            or not all(isinstance(name, str) and name for name in alarm_names)):
-        raise ConfigurationError("Config field 'stopConditionAlarmNames' must be a list of up to 100 alarm names")
-
     raw_targets = raw.get('targets', [])
     if not isinstance(raw_targets, list):
         raise ConfigurationError("Config field 'targets' must be a list")
     all_targets = [_parse_target(item, index) for index, item in enumerate(raw_targets)]
-    components = [target.component for target in all_targets]
-    if len(components) != len(set(components)):
-        raise ConfigurationError("Config field 'targets' must not contain the same component twice")
+    names = [target.name for target in all_targets]
+    if len(names) != len(set(names)):
+        raise ConfigurationError("Config field 'targets' must not contain the same name twice")
     # Disabled targets are validated but otherwise ignored.
     targets = tuple(target for target in all_targets if target.enabled)
     if enabled and not targets:
         raise ConfigurationError("Config field 'targets' must contain an enabled target when the engine is enabled")
-    # The orchestrator terminates a terminated publish instance's paired dispatcher, and the
-    # other way round, so both Auto Scaling Groups and the orchestrator are checked.
-    for target in targets:
-        partner = PAIRED_COMPONENTS.get(target.component)
-        if partner and (partner not in components or orchestrator_asg_name is None):
-            raise ConfigurationError(
-                f"Target '{target.component}' needs the '{partner}' target (enabled or not) and "
-                "'orchestratorAsgName': the orchestrator also terminates the paired instance"
-            )
 
     return EngineConfig(
         enabled=enabled,
@@ -272,9 +318,12 @@ def parse_config(raw: Any) -> EngineConfig:  # pylint: disable=too-many-locals
         daily_probability=daily_probability,
         runs_per_day=runs_per_day,
         retention_days=retention_days,
-        cloudformation_stack_name=_field(raw, 'cloudFormationStackName', str),
-        orchestrator_asg_name=orchestrator_asg_name,
-        stop_condition_alarm_names=tuple(alarm_names),
+        cloudformation_stack_name=_field(raw, 'cloudFormationStackName', str, None),
+        metric_namespace=_field(raw, 'metricNamespace', str, DEFAULT_METRIC_NAMESPACE),
+        metric_dimensions=_string_map(raw, 'metricDimensions', MAX_METRIC_DIMENSIONS, RESERVED_RECORD_KEYS,
+                                      250, 1024),
+        experiment_tags=_string_map(raw, 'experimentTags', MAX_EXPERIMENT_TAGS, FIXED_EXPERIMENT_TAG_KEYS,
+                                    128, 256),
         targets=targets,
         all_targets=tuple(all_targets),
     )
@@ -327,7 +376,7 @@ def create_claim(parameter_name: str, record: dict) -> bool:
     try:
         _client('ssm').put_parameter(
             Name=parameter_name,
-            Description='AEM Chaos Engine daily termination claim',
+            Description='ASG Chaos FIS daily termination claim',
             Value=json.dumps(record),
             Type='String',
             Overwrite=False,
@@ -357,8 +406,10 @@ def choose_target(targets: tuple[Target, ...]) -> Target:
     return _rng.choices(targets, weights=[target.weight for target in targets], k=1)[0]
 
 
-def check_stack_stable(stack_name: str) -> str | None:
-    """Fail if the CloudFormation stack is missing or being created, updated or deleted."""
+def check_stack_stable(stack_name: str | None) -> str | None:
+    """Fail if the CloudFormation stack, if configured, is missing or being created, updated or deleted."""
+    if stack_name is None:
+        return None
     try:
         stacks = _client('cloudformation').describe_stacks(StackName=stack_name)['Stacks']
     except ClientError as err:
@@ -370,6 +421,58 @@ def check_stack_stable(stack_name: str) -> str | None:
         logger.info('Stack %s is not stable: %s', stack_name, status)
         return 'PRECHECK_STACK_NOT_STABLE'
     return None
+
+
+def _unsupported_template_reason(template: dict) -> str | None:  # pylint: disable=too-many-return-statements
+    """Explain why the library cannot vouch for what the template selects, or None if it can."""
+    targets = template.get('targets') or {}
+    if len(targets) != 1:
+        return f'it has {len(targets)} targets instead of 1'
+    target = next(iter(targets.values()))
+    filters = target.get('filters') or []
+    if target.get('resourceType') != 'aws:ec2:instance':
+        return f"its target selects {target.get('resourceType')} resources, not aws:ec2:instance"
+    if target.get('resourceArns'):
+        return 'its target selects instances by ARN'
+    if not target.get('resourceTags'):
+        return 'its target does not select instances by tags'
+    if target.get('selectionMode') != 'COUNT(1)':
+        return f"its target selection mode is {target.get('selectionMode')}, not COUNT(1)"
+    if (len(filters) != 1 or filters[0].get('path') != 'State.Name'
+            or filters[0].get('values') != ['running']):
+        return 'its target is not filtered to State.Name running only'
+    for stop_condition in template.get('stopConditions') or []:
+        if stop_condition.get('source') not in ('none', 'aws:cloudwatch:alarm'):
+            return f"it has a stop condition from {stop_condition.get('source')}"
+    return None
+
+
+def read_template_target(template_id: str) -> TemplateTarget | str:
+    """
+    Read what the FIS template selects and which alarms stop it, or return the reason to skip.
+
+    The template is the single source of truth for the instances FIS can pick,
+    so only templates whose selection the pre-checks can fully cover are used:
+    one target that picks one running EC2 instance by tags.
+    """
+    try:
+        template = _client('fis').get_experiment_template(id=template_id)['experimentTemplate']
+    except ClientError as err:
+        if err.response['Error']['Code'] == 'ResourceNotFoundException':
+            logger.warning('FIS experiment template %s does not exist', template_id)
+            return 'PRECHECK_FIS_TEMPLATE_NOT_FOUND'
+        raise
+    reason = _unsupported_template_reason(template)
+    if reason:
+        logger.warning('FIS experiment template %s is not supported: %s', template_id, reason)
+        return 'PRECHECK_FIS_TEMPLATE_UNSUPPORTED'
+    target = next(iter(template['targets'].values()))
+    alarm_names = tuple(
+        stop_condition['value'].split(':alarm:', 1)[-1]
+        for stop_condition in template.get('stopConditions') or []
+        if stop_condition.get('source') == 'aws:cloudwatch:alarm'
+    )
+    return TemplateTarget(resource_tags=dict(target['resourceTags']), stop_condition_alarm_names=alarm_names)
 
 
 def check_instances_settled(instance_ids: list[str], grace_period: int, label: str) -> str | None:
@@ -403,34 +506,33 @@ def check_instances_settled(instance_ids: list[str], grace_period: int, label: s
     return None
 
 
-def check_fis_targets_in_asg(stack_prefix: str, component: str, asg_instance_ids: set[str]) -> str | None:
+def check_fis_targets_in_asg(resource_tags: dict[str, str], asg_instance_ids: set[str]) -> str | None:
     """
     Fail if FIS could pick a running instance that is not a healthy InService member of the ASG.
 
-    FIS selects any running instance with the target's StackPrefix and Component
-    tags, so this covers exactly what it can terminate, e.g. an instance that was
+    FIS selects any running instance with all of the template's target tags, so
+    this covers exactly what it can terminate, e.g. an instance that was
     detached from the Auto Scaling Group but is still running.
     """
     paginator = _client('ec2').get_paginator('describe_instances')
-    pages = paginator.paginate(Filters=[
-        {'Name': 'tag:StackPrefix', 'Values': [stack_prefix]},
-        {'Name': 'tag:Component', 'Values': [component]},
-        {'Name': 'instance-state-name', 'Values': ['running']},
-    ])
+    filters = [{'Name': f'tag:{key}', 'Values': [value]} for key, value in sorted(resource_tags.items())]
+    filters.append({'Name': 'instance-state-name', 'Values': ['running']})
+    pages = paginator.paginate(Filters=filters)
     running = {instance['InstanceId'] for page in pages for r in page['Reservations'] for instance in r['Instances']}
     outside = sorted(running - asg_instance_ids)
     if outside:
-        logger.info('Running %s instances outside the healthy ASG members: %s', component, ', '.join(outside))
+        logger.info('Running instances with tags %s outside the healthy ASG members: %s',
+                    resource_tags, ', '.join(outside))
         return 'PRECHECK_TARGET_ASG_UNMANAGED_INSTANCE'
     return None
 
 
 def check_asg_healthy(asg_name: str, min_in_service: int, label: str,  # pylint: disable=too-many-return-statements
-                      fis_target: tuple[str, str] | None = None) -> str | None:
+                      resource_tags: dict[str, str] | None = None) -> str | None:
     """
     Fail unless the Auto Scaling Group is at desired capacity, healthy, settled and idle.
 
-    ``fis_target`` = (stack prefix, component) for the target ASG, whose instances FIS selects by tag.
+    ``resource_tags`` are the FIS template's target tags for the target ASG, whose instances FIS selects by tag.
     """
     autoscaling = _client('autoscaling')
     groups = autoscaling.describe_auto_scaling_groups(AutoScalingGroupNames=[asg_name])['AutoScalingGroups']
@@ -456,8 +558,8 @@ def check_asg_healthy(asg_name: str, min_in_service: int, label: str,  # pylint:
     reason = check_instances_settled(healthy, group.get('HealthCheckGracePeriod', 0), label)
     if reason:
         return reason
-    if fis_target:
-        reason = check_fis_targets_in_asg(*fis_target, set(healthy))
+    if resource_tags:
+        reason = check_fis_targets_in_asg(resource_tags, set(healthy))
         if reason:
             return reason
     activities = autoscaling.describe_scaling_activities(AutoScalingGroupName=asg_name, MaxRecords=10)['Activities']
@@ -492,7 +594,7 @@ def check_stop_condition_alarms(alarm_names: tuple[str, ...]) -> str | None:
 
 
 def check_no_active_experiment(template_ids: set[str]) -> str | None:
-    """Fail if an experiment from any of the engine's templates is still active."""
+    """Fail if an experiment from any of the configured templates is still active."""
     fis = _client('fis')
     for template_id in sorted(template_ids):
         kwargs: dict[str, Any] = {'experimentTemplateId': template_id, 'maxResults': 100}
@@ -508,44 +610,47 @@ def check_no_active_experiment(template_ids: set[str]) -> str | None:
     return None
 
 
-def run_prechecks(config: EngineConfig, target: Target, stack_prefix: str) -> str | None:
+def run_prechecks(config: EngineConfig, target: Target) -> str | None:
     """Return the reason for the first failing pre-check, or None if all pass."""
     reason = check_stack_stable(config.cloudformation_stack_name)
+    if reason:
+        return reason
+    template_target = read_template_target(target.fis_template_id)
+    if isinstance(template_target, str):
+        return template_target
+    reason = check_asg_healthy(target.asg_name, target.min_in_service, 'TARGET_ASG',
+                               resource_tags=template_target.resource_tags)
+    for required in target.required_healthy:
+        if reason:
+            break
+        reason = check_asg_healthy(required.asg_name, required.min_in_service, 'REQUIRED_ASG')
     if reason is None:
-        reason = check_asg_healthy(target.asg_name, target.min_in_service, 'TARGET_ASG',
-                                   fis_target=(stack_prefix, target.component))
-    partner = PAIRED_COMPONENTS.get(target.component)
-    if reason is None and partner:
-        # The orchestrator also terminates the paired instance, then pairs the replacements.
-        reason = check_asg_healthy(config.asg_name(partner), target.min_in_service, 'PAIRED_ASG')
-        if reason is None:
-            reason = check_asg_healthy(config.orchestrator_asg_name, 1, 'ORCHESTRATOR_ASG')
-    if reason is None:
-        reason = check_stop_condition_alarms(config.stop_condition_alarm_names)
+        reason = check_stop_condition_alarms(template_target.stop_condition_alarm_names)
     if reason is None:
         reason = check_no_active_experiment({t.fis_template_id for t in config.all_targets})
     return reason
 
 
-def client_token(stack_prefix: str, scheduled_time: str | None, context: Any) -> str:
+def client_token(seed_prefix: str, scheduled_time: str | None, context: Any) -> str:
     """
     Build the FIS idempotency token.
 
     All invocations for the same schedule slot share a token, so FIS starts at
-    most one experiment for them.
+    most one experiment for them. ``seed_prefix`` keeps the tokens of different
+    deployments apart.
     """
     seed = scheduled_time or getattr(context, 'aws_request_id', None) or str(uuid4())
-    return hashlib.sha256(f'{stack_prefix}:{seed}'.encode()).hexdigest()
+    return hashlib.sha256(f'{seed_prefix}:{seed}'.encode()).hexdigest()
 
 
-def start_experiment(target: Target, token: str, stack_prefix: str, local_date: str) -> str:
+def start_experiment(config: EngineConfig, target: Target, token: str, local_date: str) -> str:
     """Start the target's FIS experiment and return the experiment id."""
     response = _client('fis').start_experiment(
         clientToken=token,
         experimentTemplateId=target.fis_template_id,
         tags={
-            'StackPrefix': stack_prefix,
-            'Component': target.component,
+            **config.experiment_tags,
+            'ChaosTarget': target.name,
             'TriggeredBy': TRIGGERED_BY,
             'LocalDate': local_date,
         },
@@ -553,18 +658,19 @@ def start_experiment(target: Target, token: str, stack_prefix: str, local_date: 
     return response['experiment']['id']
 
 
-def _decision(settings: Settings, status: str, reason: str, **details: Any) -> dict:
+def _decision(config: EngineConfig, status: str, reason: str, **details: Any) -> dict:
     """Log the decision as a CloudWatch Embedded Metric Format record and return it."""
+    dimensions = dict(config.metric_dimensions)
     record = {
         '_aws': {
             'Timestamp': int(time.time() * 1000),
             'CloudWatchMetrics': [{
-                'Namespace': METRIC_NAMESPACE,
-                'Dimensions': [['StackPrefix', 'Status'], ['StackPrefix', 'Reason']],
+                'Namespace': config.metric_namespace,
+                'Dimensions': [[*dimensions, 'Status'], [*dimensions, 'Reason']],
                 'Metrics': [{'Name': 'Decisions', 'Unit': 'Count'}],
             }],
         },
-        'StackPrefix': settings.stack_prefix,
+        **dimensions,
         'Status': status,
         'Reason': reason,
         'Decisions': 1,
@@ -572,16 +678,15 @@ def _decision(settings: Settings, status: str, reason: str, **details: Any) -> d
     }
     # EMF records must be written to stdout as raw JSON lines.
     print(json.dumps(record, default=str))
-    return {'status': status, 'reason': reason, 'stackPrefix': settings.stack_prefix, **details}
+    return {'status': status, 'reason': reason, **details}
 
 
-def handler(event: Any, context: Any) -> dict:  # pylint: disable=too-many-locals,too-many-return-statements
-    """Entry point, invoked by EventBridge Scheduler. Each return is one decision outcome."""
+def run(config: EngineConfig, settings: Settings,  # pylint: disable=too-many-locals,too-many-return-statements
+        event: Any = None, context: Any = None) -> dict:
+    """Decide on one run with an already parsed configuration. Each return is one decision outcome."""
     event = event if isinstance(event, dict) else {}
-    settings = Settings.from_env()
-    config = load_config(settings.config_parameter_name)
     if not config.enabled:
-        return _decision(settings, STATUS_SKIPPED, 'ENGINE_DISABLED')
+        return _decision(config, STATUS_SKIPPED, 'ENGINE_DISABLED')
 
     now = _now(config.timezone)
     today = now.date()
@@ -591,44 +696,51 @@ def handler(event: Any, context: Any) -> dict:  # pylint: disable=too-many-local
     claims = list_claims(settings.state_parameter_path)
     prune_claims(claims, today, config.retention_days)
     if today in claims:
-        return _decision(settings, STATUS_SKIPPED, 'DAILY_LIMIT_REACHED', **details)
+        return _decision(config, STATUS_SKIPPED, 'DAILY_LIMIT_REACHED', **details)
 
     roll = _rng.random()
     threshold = config.run_probability
     details.update(roll=round(roll, 4), threshold=round(threshold, 4))
     if roll >= threshold:
-        return _decision(settings, STATUS_SKIPPED, 'PROBABILITY_MISSED', **details)
+        return _decision(config, STATUS_SKIPPED, 'PROBABILITY_MISSED', **details)
 
     target = choose_target(config.targets)
-    details.update(component=target.component, asgName=target.asg_name)
+    details.update(target=target.name, asgName=target.asg_name)
 
-    reason = run_prechecks(config, target, settings.stack_prefix)
+    reason = run_prechecks(config, target)
     if reason:
-        return _decision(settings, STATUS_SKIPPED, reason, **details)
+        return _decision(config, STATUS_SKIPPED, reason, **details)
 
     if config.dry_run:
-        return _decision(settings, STATUS_DRY_RUN, 'WOULD_TERMINATE', **details)
+        return _decision(config, STATUS_DRY_RUN, 'WOULD_TERMINATE', **details)
 
     claim_name = f'{settings.state_parameter_path}/{today.isoformat()}'
     claim = {
         'status': 'CLAIMED',
         'claimedAt': now.isoformat(),
-        'component': target.component,
+        'target': target.name,
         'asgName': target.asg_name,
         'scheduledTime': scheduled_time,
         'experimentId': None,
     }
     if not create_claim(claim_name, claim):
-        return _decision(settings, STATUS_SKIPPED, 'DAILY_LIMIT_REACHED', **details)
+        return _decision(config, STATUS_SKIPPED, 'DAILY_LIMIT_REACHED', **details)
 
-    token = client_token(settings.stack_prefix, scheduled_time, context)
+    token = client_token(settings.config_parameter_name, scheduled_time, context)
     try:
-        experiment_id = start_experiment(target, token, settings.stack_prefix, today.isoformat())
+        experiment_id = start_experiment(config, target, token, today.isoformat())
     except ClientError as err:
         # Keep the claim: no further termination is attempted today.
         update_claim(claim_name, {**claim, 'status': 'FAILED', 'error': str(err)})
-        _decision(settings, STATUS_FAILED, 'FIS_START_FAILED', error=str(err), **details)
+        _decision(config, STATUS_FAILED, 'FIS_START_FAILED', error=str(err), **details)
         raise
 
     update_claim(claim_name, {**claim, 'status': 'STARTED', 'experimentId': experiment_id})
-    return _decision(settings, STATUS_EXECUTED, 'TERMINATION_STARTED', experimentId=experiment_id, **details)
+    return _decision(config, STATUS_EXECUTED, 'TERMINATION_STARTED', experimentId=experiment_id, **details)
+
+
+def handler(event: Any, context: Any) -> dict:
+    """Lambda entry point: reads the settings and the configuration, then decides on one run."""
+    settings = Settings.from_env()
+    config = load_config(settings.config_parameter_name)
+    return run(config, settings, event, context)

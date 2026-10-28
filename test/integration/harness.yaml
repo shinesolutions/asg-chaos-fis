@@ -1,14 +1,14 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >-
-  AEM Chaos Engine integration test harness. Deploys the chaos engine Lambda
-  against an existing, non-AEM test Auto Scaling Group. Throwaway: delete the
-  stack after testing.
+  ASG Chaos FIS integration test harness. Deploys the ASG Chaos FIS Lambda
+  against an existing test Auto Scaling Group. Throwaway: delete the stack
+  after testing.
 
 Parameters:
-  EngineStackPrefix:
-    Description: Stack prefix the engine runs as (SSM paths, metrics, FIS experiment tags)
+  EngineName:
+    Description: Name the engine runs as (function name, SSM paths, metric dimension, FIS experiment tags)
     Type: String
-    Default: chaos-engine-test
+    Default: asg-chaos-fis-test
     AllowedPattern: '[a-z0-9-]+'
   TargetStackPrefix:
     Description: StackPrefix tag of the instances that may be terminated
@@ -34,6 +34,13 @@ Parameters:
     Description: Healthy InService instances required before a termination
     Type: Number
     Default: 2
+    MinValue: 1
+  RequiredMinInService:
+    Description: >-
+      Healthy InService instances the target Auto Scaling Group must also have
+      as its own required Auto Scaling Group, to test requiredHealthy
+    Type: Number
+    Default: 1
     MinValue: 1
   ScheduleAt:
     Description: >-
@@ -90,16 +97,16 @@ Resources:
                 Action: ec2:DescribeInstances
                 Resource: '*'
       Tags:
-        - Key: StackPrefix
+        - Key: Engine
           Value:
-            Ref: EngineStackPrefix
+            Ref: EngineName
 
   StopConditionAlarm:
     Type: AWS::CloudWatch::Alarm
     Properties:
       AlarmName:
-        Fn::Sub: ${EngineStackPrefix}-ChaosEngine-UnHealthyHostsAlarm
-      AlarmDescription: Blocks chaos engine experiments while any target instance is unhealthy
+        Fn::Sub: ${EngineName}-UnHealthyHostsAlarm
+      AlarmDescription: Blocks ASG Chaos FIS experiments while any target instance is unhealthy
       Namespace: AWS/ELB
       MetricName: UnHealthyHostCount
       Dimensions:
@@ -117,7 +124,7 @@ Resources:
     Type: AWS::FIS::ExperimentTemplate
     Properties:
       Description:
-        Fn::Sub: Chaos engine integration test - terminate one ${TargetComponent} instance
+        Fn::Sub: ASG Chaos FIS integration test - terminate one ${TargetComponent} instance
       RoleArn:
         Fn::GetAtt: FisRole.Arn
       Targets:
@@ -147,9 +154,9 @@ Resources:
         EmptyTargetResolutionMode: fail
       Tags:
         Name:
-          Fn::Sub: ${EngineStackPrefix}-chaos-engine-test
-        StackPrefix:
-          Ref: EngineStackPrefix
+          Fn::Sub: ${EngineName}
+        Engine:
+          Ref: EngineName
 
   # --- Engine configuration --------------------------------------------------------
 
@@ -157,14 +164,17 @@ Resources:
     Type: AWS::SSM::Parameter
     Properties:
       Name:
-        Fn::Sub: /aem-opencloud/${EngineStackPrefix}/chaos-engine/config
-      Description: AEM Chaos Engine integration test configuration
+        Fn::Sub: /asg-chaos-fis/${EngineName}/config
+      Description: ASG Chaos FIS integration test configuration
       Type: String
-      # The component label is only used for validation, logs and tags. Which
-      # instances are terminated is decided by ExperimentTemplate and FisRole.
+      # The target name is only used for logs, claims and tags. Which instances
+      # are terminated is decided by ExperimentTemplate and FisRole. The target
+      # requires its own Auto Scaling Group, so that requiredHealthy can be
+      # tested without a second Auto Scaling Group.
       Value:
         Fn::Sub: |
           {
+            "schemaVersion": 1,
             "enabled": true,
             "dryRun": ${DryRun},
             "timezone": "Australia/Sydney",
@@ -172,15 +182,20 @@ Resources:
             "runsPerDay": 1,
             "retentionDays": 7,
             "cloudFormationStackName": "${TargetStackName}",
-            "stopConditionAlarmNames": ["${StopConditionAlarm}"],
+            "metricNamespace": "ASGChaosFIS/IntegrationTest",
+            "metricDimensions": {"Engine": "${EngineName}"},
+            "experimentTags": {"Engine": "${EngineName}"},
             "targets": [
               {
-                "component": "author-dispatcher",
+                "name": "integration-test",
                 "enabled": true,
                 "asgName": "${TargetAsgName}",
                 "fisTemplateId": "${ExperimentTemplate}",
                 "weight": 1,
-                "minInService": ${MinInService}
+                "minInService": ${MinInService},
+                "requiredHealthy": [
+                  {"asgName": "${TargetAsgName}", "minInService": ${RequiredMinInService}}
+                ]
               }
             ]
           }
@@ -191,7 +206,7 @@ Resources:
     Type: AWS::Logs::LogGroup
     Properties:
       LogGroupName:
-        Fn::Sub: /aws/lambda/${EngineStackPrefix}-aem-chaos-engine
+        Fn::Sub: /aws/lambda/${EngineName}-asg-chaos-fis
       RetentionInDays: 7
 
   FunctionRole:
@@ -209,7 +224,7 @@ Resources:
                 aws:SourceAccount:
                   Ref: AWS::AccountId
       Policies:
-        - PolicyName: ChaosEngine
+        - PolicyName: AsgChaosFis
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
@@ -224,26 +239,31 @@ Resources:
                 Effect: Allow
                 Action: ssm:GetParameter
                 Resource:
-                  Fn::Sub: arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/aem-opencloud/${EngineStackPrefix}/chaos-engine/config
+                  Fn::Sub: arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/asg-chaos-fis/${EngineName}/config
               - Sid: ListClaims
                 Effect: Allow
                 Action: ssm:GetParametersByPath
                 Resource:
-                  - Fn::Sub: arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/aem-opencloud/${EngineStackPrefix}/chaos-engine/kills
-                  - Fn::Sub: arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/aem-opencloud/${EngineStackPrefix}/chaos-engine/kills/*
+                  - Fn::Sub: arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/asg-chaos-fis/${EngineName}/kills
+                  - Fn::Sub: arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/asg-chaos-fis/${EngineName}/kills/*
               - Sid: WriteClaims
                 Effect: Allow
                 Action:
                   - ssm:PutParameter
                   - ssm:DeleteParameters
                 Resource:
-                  Fn::Sub: arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/aem-opencloud/${EngineStackPrefix}/chaos-engine/kills/*
+                  Fn::Sub: arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/asg-chaos-fis/${EngineName}/kills/*
               - Sid: StartOnlyThisTemplate
                 Effect: Allow
                 Action: fis:StartExperiment
                 Resource:
                   - Fn::Sub: arn:${AWS::Partition}:fis:${AWS::Region}:${AWS::AccountId}:experiment-template/${ExperimentTemplate}
                   - Fn::Sub: arn:${AWS::Partition}:fis:${AWS::Region}:${AWS::AccountId}:experiment/*
+              - Sid: ReadOnlyThisTemplate
+                Effect: Allow
+                Action: fis:GetExperimentTemplate
+                Resource:
+                  Fn::Sub: arn:${AWS::Partition}:fis:${AWS::Region}:${AWS::AccountId}:experiment-template/${ExperimentTemplate}
               - Sid: TagExperiments
                 Effect: Allow
                 Action: fis:TagResource
@@ -272,24 +292,24 @@ Resources:
                 Resource:
                   Fn::Sub: arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${TargetStackName}/*
       Tags:
-        - Key: StackPrefix
+        - Key: Engine
           Value:
-            Ref: EngineStackPrefix
+            Ref: EngineName
 
   Function:
     Type: AWS::Lambda::Function
     DependsOn: FunctionLogGroup
     Properties:
       FunctionName:
-        Fn::Sub: ${EngineStackPrefix}-aem-chaos-engine
-      Description: AEM Chaos Engine (integration test)
+        Fn::Sub: ${EngineName}-asg-chaos-fis
+      Description: ASG Chaos FIS (integration test)
       # Placeholder only. run-integration-tests.sh deploy replaces it with the
       # locally built zip (aws lambda update-function-code). Stack updates leave
       # the uploaded code alone as long as this property does not change.
-      # Until then, invocations fail because aem_chaos_engine.py does not exist.
+      # Until then, invocations fail because asg_chaos_fis.py does not exist.
       Code:
         ZipFile: '# Placeholder, replaced by run-integration-tests.sh deploy'
-      Handler: aem_chaos_engine.handler
+      Handler: asg_chaos_fis.handler
       Runtime: python3.12
       MemorySize: 128
       Timeout: 60
@@ -297,17 +317,15 @@ Resources:
         Fn::GetAtt: FunctionRole.Arn
       Environment:
         Variables:
-          STACK_PREFIX:
-            Ref: EngineStackPrefix
           CONFIG_PARAMETER_NAME:
             Ref: ConfigParameter
           STATE_PARAMETER_PATH:
-            Fn::Sub: /aem-opencloud/${EngineStackPrefix}/chaos-engine/kills
+            Fn::Sub: /asg-chaos-fis/${EngineName}/kills
           LOG_LEVEL: INFO
       Tags:
-        - Key: StackPrefix
+        - Key: Engine
           Value:
-            Ref: EngineStackPrefix
+            Ref: EngineName
 
   FunctionInvokeConfig:
     Type: AWS::Lambda::EventInvokeConfig
@@ -336,7 +354,7 @@ Resources:
                 aws:SourceAccount:
                   Ref: AWS::AccountId
       Policies:
-        - PolicyName: InvokeChaosEngine
+        - PolicyName: InvokeAsgChaosFis
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
@@ -350,8 +368,8 @@ Resources:
     Condition: CreateScheduleCondition
     Properties:
       Name:
-        Fn::Sub: ${EngineStackPrefix}-chaos-engine
-      Description: One-off chaos engine invocation for the integration test
+        Fn::Sub: ${EngineName}-asg-chaos-fis
+      Description: One-off ASG Chaos FIS invocation for the integration test
       ScheduleExpression:
         Fn::Sub: at(${ScheduleAt})
       ScheduleExpressionTimezone: UTC
@@ -385,4 +403,4 @@ Outputs:
       Ref: StopConditionAlarm
   StatePath:
     Value:
-      Fn::Sub: /aem-opencloud/${EngineStackPrefix}/chaos-engine/kills
+      Fn::Sub: /asg-chaos-fis/${EngineName}/kills

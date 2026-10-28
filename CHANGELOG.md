@@ -8,13 +8,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## Unreleased
 
 ### Added
-- Initial AEM Chaos Engine Lambda, replacing the Simian Army Chaos Monkey for AEM full-set stacks
+- Initial ASG Chaos FIS Lambda, which terminates one random instance of one of the configured Auto Scaling Groups at most once a day, using an AWS FIS experiment template
 - Maximum of one termination per local day across all targets, enforced by an atomic SSM parameter claim
-- Weighted target selection across author-dispatcher, publish and publish-dispatcher Auto Scaling Groups, each of which can be disabled
-- Pre-checks for stack stability, Auto Scaling Group health, orchestrator health and active experiments
+- Weighted target selection across the configured Auto Scaling Groups, each of which can be disabled
+- Configuration `schemaVersion`, so that a configuration for another version fails the invocation
+- Pre-checks for stack stability (optional), Auto Scaling Group health and active experiments
 - Pre-checks that Auto Scaling Group instances are running in EC2 and past the health check grace period
-- Pre-check that the stop condition alarms are OK before the day is claimed
 - Pre-checks that the target Auto Scaling Group has no instance in another lifecycle state, and that FIS can only select its healthy InService instances
-- Pre-checks of the paired Auto Scaling Group and the orchestrator for publish and publish-dispatcher, which the orchestrator terminates in pairs
+- Pre-checks of each target's `requiredHealthy` Auto Scaling Groups
+- Target tags and stop condition alarms read from each target's FIS experiment template, and a pre-check that skips templates whose selection the pre-checks cannot fully cover
+- Pre-check that the stop condition alarms are OK before the day is claimed
+- Configurable experiment tags, plus `ChaosTarget`, `TriggeredBy` and `LocalDate` on every experiment
 - Dry run mode
-- Decision metrics in CloudWatch Embedded Metric Format
+- Decision metrics in CloudWatch Embedded Metric Format, with a configurable namespace and dimensions
+- `run()` entry point for deployments that build the configuration in code
+- SHA-256 checksum file published next to each release zip

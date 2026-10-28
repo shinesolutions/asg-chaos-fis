@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 #
-# AEM Chaos Engine integration tests.
+# ASG Chaos FIS integration tests.
 #
-# Deploys the engine (test/integration/harness.yaml) against an existing,
-# non-AEM test Auto Scaling Group and checks its behaviour against real AWS
-# services. See test/integration/README.md.
+# Deploys the engine (test/integration/harness.yaml) against an existing test
+# Auto Scaling Group and checks its behaviour against real AWS services. See
+# test/integration/README.md.
 #
 # Usage: test/integration/run-integration-tests.sh <command>
 #
@@ -23,7 +23,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 ENV_FILE="${ENV_FILE:-${SCRIPT_DIR}/integration.env}"
 
-# Components of real AEM stacks. The harness must never target these.
+# Components of real AEM OpenCloud stacks, which may run in the same test account.
+# The harness must never target these.
 PROTECTED_COMPONENTS="author author-primary author-standby author-dispatcher publish publish-dispatcher
 preview-publish preview-publish-dispatcher orchestrator chaos-monkey"
 
@@ -66,13 +67,13 @@ load_env() {
   # shellcheck source=/dev/null
   source "${ENV_FILE}"
   local name
-  for name in AWS_REGION HARNESS_STACK_NAME ENGINE_STACK_PREFIX TARGET_STACK_PREFIX \
+  for name in AWS_REGION HARNESS_STACK_NAME ENGINE_NAME TARGET_STACK_PREFIX \
               TARGET_COMPONENT TARGET_ASG_NAME TARGET_STACK_NAME TARGET_LOAD_BALANCER_NAME; do
     [[ -n "${!name:-}" ]] || die "${name} is not set in ${ENV_FILE}"
   done
   export AWS_REGION AWS_DEFAULT_REGION="${AWS_REGION}"
-  FUNCTION_NAME="${ENGINE_STACK_PREFIX}-aem-chaos-engine"
-  STATE_PATH="/aem-opencloud/${ENGINE_STACK_PREFIX}/chaos-engine/kills"
+  FUNCTION_NAME="${ENGINE_NAME}-asg-chaos-fis"
+  STATE_PATH="/asg-chaos-fis/${ENGINE_NAME}/kills"
 }
 
 stack_output() {
@@ -185,7 +186,7 @@ wait_until_settled() {
 set_config_dry_run() {
   # Switch dry run directly in SSM. Takes seconds, unlike a stack update.
   # The next update_stack writes the parameter from the template again.
-  local name="/aem-opencloud/${ENGINE_STACK_PREFIX}/chaos-engine/config" value
+  local name="/asg-chaos-fis/${ENGINE_NAME}/config" value
   value="$(aws ssm get-parameter --name "${name}" --query Parameter.Value --output text \
     | python3 -c 'import json, sys; c = json.load(sys.stdin); c["dryRun"] = sys.argv[1] == "true"; print(json.dumps(c))' "$1")"
   aws ssm put-parameter --name "${name}" --type String --overwrite --value "${value}" >/dev/null
@@ -243,7 +244,7 @@ cmd_preflight() {
   local component
   for component in ${PROTECTED_COMPONENTS}; do
     [[ "${TARGET_COMPONENT}" != "${component}" ]] \
-      || die "TARGET_COMPONENT '${TARGET_COMPONENT}' is an AEM component. Use a non-AEM test Auto Scaling Group."
+      || die "TARGET_COMPONENT '${TARGET_COMPONENT}' is an AEM OpenCloud component. Use a test Auto Scaling Group."
   done
 
   local identity
@@ -275,15 +276,16 @@ cmd_deploy() {
   log "Packaging the Lambda"
   make -C "${REPO_DIR}" --no-print-directory clean package >/dev/null
   local zip
-  zip="$(ls "${REPO_DIR}"/stage/aem-chaos-engine-*.zip)"
+  zip="$(ls "${REPO_DIR}"/stage/asg-chaos-fis-*.zip)"
   info "Built ${zip}"
 
   log "Deploying harness stack ${HARNESS_STACK_NAME} (dry run mode)"
   update_stack \
-    "EngineStackPrefix=${ENGINE_STACK_PREFIX}" \
+    "EngineName=${ENGINE_NAME}" \
     "TargetStackPrefix=${TARGET_STACK_PREFIX}" "TargetComponent=${TARGET_COMPONENT}" \
     "TargetAsgName=${TARGET_ASG_NAME}" "TargetStackName=${TARGET_STACK_NAME}" \
-    "TargetLoadBalancerName=${TARGET_LOAD_BALANCER_NAME}" DryRun=true MinInService=2 ScheduleAt=
+    "TargetLoadBalancerName=${TARGET_LOAD_BALANCER_NAME}" DryRun=true MinInService=2 RequiredMinInService=1 \
+    ScheduleAt=
   pass "Harness stack deployed"
 
   log "Uploading the Lambda code directly from ${zip}"
@@ -332,6 +334,10 @@ cmd_iam() {
   check "Lambda role may start the harness experiment template" allowed "${result}"
   result="$(simulate "${function_role}" fis:StartExperiment "${template_arn}/EXTOTHERTEMPLATE")"
   check "Lambda role may not start any other experiment template" implicitDeny "${result}"
+  result="$(simulate "${function_role}" fis:GetExperimentTemplate "${template_arn}/${template}")"
+  check "Lambda role may read the harness experiment template" allowed "${result}"
+  result="$(simulate "${function_role}" fis:GetExperimentTemplate "${template_arn}/EXTOTHERTEMPLATE")"
+  check "Lambda role may not read any other experiment template" implicitDeny "${result}"
   result="$(simulate "${function_role}" ec2:TerminateInstances "${instance_arn}" "${TARGET_STACK_PREFIX}" "${TARGET_COMPONENT}")"
   check "Lambda role may not terminate instances itself" implicitDeny "${result}"
   # DescribeAlarms is authorised against alarm:*, whichever alarm names are requested
@@ -360,6 +366,12 @@ cmd_dry_run() {
   invoke precheck
   check "Reason" PRECHECK_TARGET_ASG_BELOW_MIN_IN_SERVICE "$(json_get "${WORK_DIR}/precheck.json" reason)"
   update_stack MinInService=2
+
+  info "Test: pre-check blocks a termination when a required Auto Scaling Group has too few instances"
+  update_stack RequiredMinInService=3
+  invoke required-precheck
+  check "Reason" PRECHECK_REQUIRED_ASG_BELOW_MIN_IN_SERVICE "$(json_get "${WORK_DIR}/required-precheck.json" reason)"
+  update_stack RequiredMinInService=1
 
   info "Test: a stop condition alarm that is not OK blocks a termination before the day is claimed"
   aws cloudwatch set-alarm-state --alarm-name "${alarm}" --state-value ALARM --state-reason "Integration test"
@@ -418,7 +430,7 @@ cmd_kill() {
   before="$(running_instances)"
   aws cloudwatch set-alarm-state --alarm-name "${alarm}" --state-value ALARM --state-reason "Integration test"
   experiment="$(aws fis start-experiment --experiment-template-id "${template}" \
-    --tags Name=chaos-engine-integration-backstop --query experiment.id --output text)"
+    --tags Name=asg-chaos-fis-integration-backstop --query experiment.id --output text)"
   status="$(wait_for_experiment "${experiment}")"
   info "Experiment ${experiment}: ${status} ($(aws fis get-experiment --id "${experiment}" --query experiment.state.reason --output text))"
   aws cloudwatch set-alarm-state --alarm-name "${alarm}" --state-value OK --state-reason "Integration test"
