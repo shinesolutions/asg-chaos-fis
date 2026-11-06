@@ -1,16 +1,15 @@
 ---
 name: Release Patch
 on: [workflow_dispatch]
-# The release action pushes with the organisation token, not GITHUB_TOKEN.
 permissions:
   contents: read
 jobs:
   build:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     steps:
-      - uses: cliffano/release-action@3b54fd19765f2cbb3d25ea656bc7b6c1996d1d46  # v2.0.0
+      - uses: cliffano/release-action@v2.2.0
         with:
           release_type: patch
           github_token: ${{ secrets.SHINEOPENSOURCE_GITHUB_TOKEN }}
-          git_user_email: shinesworks@shinesolutions.com
-          git_user_name: Shine Works
+          git_user_email: opensource@shinesolutions.com
+          git_user_name: Shine Solutions
