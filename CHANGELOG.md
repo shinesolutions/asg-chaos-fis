@@ -1,12 +1,10 @@
 # Changelog
-
 All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## Unreleased
-
+## 0.10.0 - 2026-11-06
 ### Added
 - Initial ASG Chaos FIS Lambda, which terminates one random instance of one of the configured Auto Scaling Groups at most once a day, using an AWS FIS experiment template
 - Maximum of one termination per local day across all targets, enforced by an atomic SSM parameter claim
