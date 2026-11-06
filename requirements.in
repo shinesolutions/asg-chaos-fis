@@ -1,4 +1,6 @@
+actionlint-py
 boto3
 botocore
 pylint
 pytest
+yamllint

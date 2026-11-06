@@ -23,6 +23,9 @@ rmdeps:
 
 lint:
 	$(call python_venv,pylint lambda/*.py test/*.py)
+	$(call python_venv,yaml-lint .github/workflows/*.yaml)
+	$(call python_venv,actionlint -shellcheck= .github/workflows/*.yaml)
+	markdownlint-cli2 README.md docs/*.md
 
 test:
 	$(call python_venv,pytest --log-cli-level=info)
