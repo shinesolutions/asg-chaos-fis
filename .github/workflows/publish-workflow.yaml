@@ -1,7 +1,4 @@
 ---
-# Attaches stage/asg-chaos-fis-<version>.zip and its .sha256 checksum file to
-# the GitHub release for each version tag, where deployments such as
-# aem-aws-stack-builder's fetch-library playbook download them.
 name: Publish
 on:
   push:
