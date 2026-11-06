@@ -1,7 +1,6 @@
 ---
 name: Release Minor
 on: [workflow_dispatch]
-# The release action pushes with the organisation token, not GITHUB_TOKEN.
 permissions:
   contents: read
 jobs:
