@@ -1,5 +1,4 @@
-ASG Chaos FIS
--------------
+# ASG Chaos FIS
 
 A Lambda that tests whether Auto Scaling Groups recover on their own: at most once a day, it terminates one random instance of one of the configured Auto Scaling Groups, using an [AWS Fault Injection Service (FIS)](https://docs.aws.amazon.com/fis/latest/userguide/what-is.html) experiment template.
 
@@ -13,8 +12,7 @@ The Auto Scaling Group then replaces the instance.
 
 The library only knows about Auto Scaling Groups and FIS experiment templates. The deployment creates the schedule, the experiment templates, the IAM roles and the [configuration](#configuration-parameter), which holds all application-specific knowledge: which Auto Scaling Groups may be targeted, and which others must be healthy first. For example, [aem-aws-stack-builder](https://github.com/shinesolutions/aem-aws-stack-builder) deploys it as the AEM Chaos Engine.
 
-Safety guardrails
------------------
+## Safety guardrails
 
 * **At most one termination per day, across all targets.** The local calendar day (in the configured timezone) is claimed by creating an SSM parameter with `Overwrite=False`, which succeeds for only one caller. The claim is created *before* FIS is called and is kept even if FIS fails, so neither a failure nor a duplicate invocation can lead to a second termination on the same day.
 * **Only experiment templates whose selection the pre-checks fully cover.** A target's template must have exactly one target that selects one (`COUNT(1)`) running EC2 instance by tags, with no other filter and no instance ARNs. Otherwise the run is skipped with `PRECHECK_FIS_TEMPLATE_UNSUPPORTED`.
@@ -38,8 +36,7 @@ The configuration has no list of allowed targets. Which instances can be termina
 
 Someone who can change the SSM configuration can therefore choose between the deployment's templates, but cannot widen either boundary.
 
-How a run decides
------------------
+## How a run decides
 
 | Step | Outcome when the step stops the run |
 |------|-------------------------------------|
@@ -59,8 +56,7 @@ The probability roll works like Simian Army's: `dailyProbability` is spread over
 
 The pre-check reasons are `PRECHECK_STACK_NOT_FOUND`, `PRECHECK_STACK_NOT_STABLE`, `PRECHECK_FIS_TEMPLATE_NOT_FOUND`, `PRECHECK_FIS_TEMPLATE_UNSUPPORTED`, `PRECHECK_TARGET_ASG_*` and `PRECHECK_REQUIRED_ASG_*` (`NOT_FOUND`, `DEGRADED`, `BELOW_MIN_IN_SERVICE`, `INSTANCE_NOT_IN_SERVICE`, `INSTANCE_NOT_RUNNING`, `IN_GRACE_PERIOD`, `SCALING_IN_PROGRESS`, and for the target only `UNMANAGED_INSTANCE` and `UNTAGGED_INSTANCE`), `PRECHECK_STOP_CONDITION_ALARM`, `PRECHECK_STOP_CONDITION_ALARM_NOT_FOUND` and `PRECHECK_EXPERIMENT_ACTIVE`.
 
-Configuration
--------------
+## Configuration
 
 ### Environment variables
 
@@ -143,8 +139,7 @@ def handler(event, context):
     return asg_chaos_fis.run(config, settings, event, context)
 ```
 
-IAM permissions
----------------
+## IAM permissions
 
 The Lambda execution role needs:
 
@@ -164,17 +159,15 @@ The Lambda execution role needs:
 
 `iam:PassRole` is not needed, because the FIS role is attached to the experiment templates.
 
-Metrics
--------
+## Metrics
 
 Every run writes one decision record to stdout in [CloudWatch Embedded Metric Format](https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/CloudWatch_Embedded_Metric_Format.html). This creates the `Decisions` metric in `metricNamespace`, with the `metricDimensions` plus either `Status` or `Reason`, without needing `cloudwatch:PutMetricData`.
 
-Development
------------
+## Development
 
 Requirements: Python 3.12 and `zip`.
 
-```
+```shell
 python3.12 -m venv .venv
 source .venv/bin/activate
 make ci
@@ -186,8 +179,7 @@ The tests use botocore Stubbers, so they make no AWS calls and check every reque
 
 [test/integration](test/integration/README.md) contains integration tests that run the engine against a test Auto Scaling Group in a real AWS account.
 
-Release
--------
+## Release
 
 Run the `Release Patch`, `Release Minor` or `Release Major` GitHub workflow. It updates `Makefile` and `CHANGELOG.md`, and tags the release. The `Publish` workflow then attaches `asg-chaos-fis-<version>.zip` and `asg-chaos-fis-<version>.zip.sha256` to the GitHub release.
 
