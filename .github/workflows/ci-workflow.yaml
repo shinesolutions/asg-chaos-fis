@@ -8,7 +8,8 @@ jobs:
     runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
+      - uses: cliffano/command-docker-action@v2.1.0
         with:
-          python-version: '3.14'
-      - run: make ci
+          command: 'make ci'
+          image: shinesolutions/aem-platform-buildenv:6.5.0
+          shell: bash

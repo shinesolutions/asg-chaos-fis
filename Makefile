@@ -40,4 +40,12 @@ package:
 release:
 	rtk release
 
-.PHONY: ci clean deps dpes-upgrade rmdeps lint test package release
+publish:
+	gh release view "$(version)" >/dev/null 2>&1 \
+	  || gh release create "$(version)" --title "$(version)" --notes "See CHANGELOG.md"
+	gh release upload "$(version)" \
+	  "stage/asg-chaos-fis-$(version).zip" \
+	  "stage/asg-chaos-fis-$(version).zip.sha256" \
+	  --clobber
+
+.PHONY: ci clean deps dpes-upgrade rmdeps lint test package release publish

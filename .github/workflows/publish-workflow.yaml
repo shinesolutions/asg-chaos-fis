@@ -14,16 +14,11 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
+      - uses: cliffano/command-docker-action@v2.1.0
         with:
-          python-version: '3.14'
-      - run: make ci version="${GITHUB_REF_NAME}"
-      - env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1 \
-            || gh release create "${GITHUB_REF_NAME}" --title "${GITHUB_REF_NAME}" --notes "See CHANGELOG.md"
-          gh release upload "${GITHUB_REF_NAME}" \
-            "stage/asg-chaos-fis-${GITHUB_REF_NAME}.zip" \
-            "stage/asg-chaos-fis-${GITHUB_REF_NAME}.zip.sha256" \
-            --clobber
+          command: make ci
+          image: shinesolutions/aem-platform-buildenv:6.3.0
+          shell: bash
+      - run: make publish
+        env:
+          GITHUB_TOKEN: ${{ secrets.SHINEOPENSOURCE_GITHUB_TOKEN }}
