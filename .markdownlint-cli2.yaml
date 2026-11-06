@@ -1,0 +1,4 @@
+config:
+  MD013:
+    # Table rows cannot be wrapped.
+    tables: false
