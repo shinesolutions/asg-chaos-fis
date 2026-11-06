@@ -1,0 +1,39 @@
+{
+  "schemaVersion": 1,
+  "enabled": true,
+  "dryRun": false,
+  "timezone": "Australia/Sydney",
+  "dailyProbability": 1.0,
+  "runsPerDay": 6,
+  "retentionDays": 7,
+  "cloudFormationStackName": "demo-main-stack",
+  "metricNamespace": "Demo/Chaos",
+  "metricDimensions": {
+    "App": "demo"
+  },
+  "experimentTags": {
+    "App": "demo"
+  },
+  "targets": [
+    {
+      "name": "web",
+      "enabled": true,
+      "asgName": "demo-web-asg",
+      "fisTemplateId": "EXTWEB",
+      "weight": 1,
+      "minInService": 2
+    },
+    {
+      "name": "api",
+      "enabled": true,
+      "asgName": "demo-api-asg",
+      "fisTemplateId": "EXTAPI",
+      "weight": 1,
+      "minInService": 2,
+      "requiredHealthy": [
+        {"asgName": "demo-worker-asg", "minInService": 2},
+        {"asgName": "demo-coordinator-asg", "minInService": 1}
+      ]
+    }
+  ]
+}
